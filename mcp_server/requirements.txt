@@ -1,0 +1,6 @@
+fastmcp>=2.0,<3
+google-adk>=1.29,<2
+google-cloud-spanner>=3.64
+google-cloud-aiplatform>=1.147
+google-genai>=1.72
+python-dotenv>=1.0

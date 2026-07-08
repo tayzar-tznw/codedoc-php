@@ -1,0 +1,23 @@
+# Cloud Build config for the CodeDoc MCP server image.
+# Invoked by mcp_server/deploy.sh from the project root so that the build
+# context includes graph_query_agent/ alongside mcp_server/.
+#
+# Manual invocation:
+#   gcloud builds submit . --config mcp_server/cloudbuild.yaml
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag=gcr.io/$PROJECT_ID/codedoc-mcp:latest
+      - --tag=gcr.io/$PROJECT_ID/codedoc-mcp:$SHORT_SHA
+      - --file=mcp_server/Dockerfile
+      - .
+
+images:
+  - gcr.io/$PROJECT_ID/codedoc-mcp:latest
+  - gcr.io/$PROJECT_ID/codedoc-mcp:$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY

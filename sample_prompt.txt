@@ -1,0 +1,5 @@
+ UsersTable.php と ArticlesTable.php どっちらがインパクト大きい？
+ AppControllerを継承するクラスは？
+ UsersController.php は何をするファイルですか？
+ 循環依存はあるか？
+ UsersController のメソッド一覧 (Graph がないと全部でない)

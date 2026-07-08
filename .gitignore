@@ -1,0 +1,30 @@
+# ----- Deprecated directories (do not delete yet) -----
+# code_doc_agent/   -- older agent without Vertex AI SDK or tree-sitter;
+#                      not imported by any current code.
+# graph_agent_a/    -- uses LLM entity extraction, superseded by tree-sitter
+#                      in code_docs_vertex_ai_sdk/; not imported by any current code.
+#
+# Duplicated constants note:
+#   SOURCE_EXTENSIONS and SKIP_DIRS are defined in three places:
+#     - code_doc_agent/tools.py        (deprecated copy)
+#     - graph_agent_a/tools.py         (deprecated copy)
+#     - code_docs_vertex_ai_sdk/config.py  (canonical copy)
+
+# IDE / OS
+.idea/
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv*/
+
+# Secrets
+.env
+
+# Project-specific output
+output_docs/
+output_docs_pipeline/
+test_codes/
