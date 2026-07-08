@@ -1,0 +1,20 @@
+{
+    "name": "codedoc/php-plain-fixture",
+    "description": "Semantic-resolution test fixture: plain PHP, no framework. Vendor tree is hand-authored to simulate installed packages.",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.2",
+        "acme/reporting": "^1.0",
+        "globex/reporting": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/"
+        },
+        "files": [
+            "src/S13_Functions/labels.php",
+            "src/S13_Functions/labels_global.php"
+        ]
+    }
+}

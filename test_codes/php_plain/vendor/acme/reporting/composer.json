@@ -1,0 +1,14 @@
+{
+    "name": "acme/reporting",
+    "description": "Acme reporting package (fixture twin of globex/reporting)",
+    "type": "library",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "Acme\\Reporting\\": "src/"
+        }
+    }
+}

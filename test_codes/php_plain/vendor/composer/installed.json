@@ -1,0 +1,30 @@
+{
+    "packages": [
+        {
+            "name": "acme/reporting",
+            "version": "1.0.0",
+            "version_normalized": "1.0.0.0",
+            "type": "library",
+            "install-path": "../acme/reporting",
+            "autoload": {
+                "psr-4": {
+                    "Acme\\Reporting\\": "src/"
+                }
+            }
+        },
+        {
+            "name": "globex/reporting",
+            "version": "1.0.0",
+            "version_normalized": "1.0.0.0",
+            "type": "library",
+            "install-path": "../globex/reporting",
+            "autoload": {
+                "psr-4": {
+                    "Globex\\Reporting\\": "src/"
+                }
+            }
+        }
+    ],
+    "dev": false,
+    "dev-package-names": []
+}

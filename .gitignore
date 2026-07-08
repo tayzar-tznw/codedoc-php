@@ -27,4 +27,13 @@ __pycache__/
 # Project-specific output
 output_docs/
 output_docs_pipeline/
-test_codes/
+
+# Test fixtures: authored PHP fixtures are committed; bulk (vendor etc.) stays local
+test_codes/*
+!test_codes/README.md
+!test_codes/validate_ground_truth.py
+!test_codes/php_plain/
+!test_codes/php_cakephp/
+test_codes/php_cakephp/vendor/
+test_codes/php_cakephp/tmp/
+test_codes/php_cakephp/logs/
