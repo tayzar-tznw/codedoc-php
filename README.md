@@ -306,6 +306,8 @@ python -m graph_generator analyze /path/to/source --exclude-vendor   # 取り込
 
 ### 複数リポジトリの取り扱い
 
+> 詳細な手順・クエリ例・移行方法は **[MULTI_REPO_GUIDE.md](MULTI_REPO_GUIDE.md)** を参照してください。
+
 複数のリポジトリを **1 つの Spanner グラフに同居**させられます。各ノードは `repo`
 プロパティを持ち、ノード ID は `(repo, 相対パス, FQCN, メンバー)` でハッシュされるため、
 **リポジトリ間で同名のメソッド・クラスが衝突して 1 ノードに統合されることはありません**。
