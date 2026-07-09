@@ -402,7 +402,11 @@ def _build_graph_view(built: dict, derived: dict) -> dict:
         "imports": edges("FileImports"),
         "maps_to_table": edges("ClassMapsToTable") if "ClassMapsToTable" in derived["rows"] else [],
         "table_refs": derived["rows"].get("TableReferences", []),
-        "db_tables": {r[1]: r for r in derived["rows"].get("DbTables", [])} if "DbTables" in derived["rows"] else {},
+        # DbTables is a NODE table (in built), not an edge table (derived).
+        "db_tables": {r[1]: r for r in built["rows"].get("DbTables", [])},
+        # table_id → table name, so DB checks answer with stable names rather
+        # than repo-scoped node IDs.
+        "table_name_by_id": {r[0]: r[1] for r in built["rows"].get("DbTables", [])},
     }
     return view
 
@@ -468,7 +472,9 @@ def answer_question(q: dict, view: dict) -> tuple[bool, str]:
         return _final(actual)
     if ctype == "class_table":
         cid = view["id_by_fqcn"].get(_norm(subject), "")
-        actual = [t for c, t in view["maps_to_table"] if c == cid]
+        # answer with stable table names, not repo-scoped node IDs
+        actual = [view["table_name_by_id"].get(t, t)
+                  for c, t in view["maps_to_table"] if c == cid]
         return _final(actual)
     if ctype == "table_columns":
         row = view["db_tables"].get(subject)
@@ -480,8 +486,10 @@ def answer_question(q: dict, view: dict) -> tuple[bool, str]:
             cols = []
         return _final(cols)
     if ctype == "table_fks":
-        actual = [f"{r[4]}->{r[2]}" for r in view["table_refs"] if r[1] == subject] \
-            if view["table_refs"] and len(view["table_refs"][0]) > 4 else []
+        # subject is a table NAME; answer "fk_column->referenced_table_name"
+        tn = view["table_name_by_id"]
+        actual = [f"{r[3]}->{tn.get(r[2], r[2])}"
+                  for r in view["table_refs"] if tn.get(r[1]) == subject]
         return _final(actual)
     if ctype == "count_at_least":
         table = check.get("table", "MethodCalls")

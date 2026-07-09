@@ -49,33 +49,33 @@ NODE_SPEC: dict[str, tuple[str, list[tuple[str, str]]]] = {
     "Files": ("file_id", [
         ("file_id", "str"), ("file_name", "str"), ("extension", "str"),
         ("directory", "str"), ("path", "str"), ("origin", "str"),
-        ("summary", "str"), ("embedding", "vec"),
+        ("summary", "str"), ("repo", "str"), ("embedding", "vec"),
     ]),
     "Classes": ("class_id", [
         ("class_id", "str"), ("name", "str"), ("namespace", "str"),
         ("fqcn", "str"), ("file_id", "str"), ("kind", "str"),
         ("modifiers", "str"), ("start_line", "int"), ("end_line", "int"),
-        ("origin", "str"), ("summary", "str"), ("embedding", "vec"),
+        ("origin", "str"), ("summary", "str"), ("repo", "str"), ("embedding", "vec"),
     ]),
     "Methods": ("method_id", [
         ("method_id", "str"), ("name", "str"), ("class_id", "str"),
         ("file_id", "str"), ("fqmn", "str"), ("signature", "str"),
         ("modifiers", "str"), ("return_type", "str"), ("start_line", "int"),
         ("end_line", "int"), ("origin", "str"), ("summary", "str"),
-        ("embedding", "vec"),
+        ("repo", "str"), ("embedding", "vec"),
     ]),
     "Modules": ("module_id", [
         ("module_id", "str"), ("name", "str"), ("summary", "str"),
-        ("embedding", "vec"),
+        ("repo", "str"), ("embedding", "vec"),
     ]),
     "Directories": ("dir_id", [
         ("dir_id", "str"), ("name", "str"), ("summary", "str"),
-        ("embedding", "vec"),
+        ("repo", "str"), ("embedding", "vec"),
     ]),
     "DbTables": ("table_id", [
         ("table_id", "str"), ("name", "str"), ("columns", "str"),
         ("indexes", "str"), ("foreign_keys", "str"), ("source_file", "str"),
-        ("plugin", "str"), ("summary", "str"), ("embedding", "vec"),
+        ("plugin", "str"), ("summary", "str"), ("repo", "str"), ("embedding", "vec"),
     ]),
 }
 

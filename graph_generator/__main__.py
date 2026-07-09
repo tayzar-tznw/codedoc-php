@@ -15,6 +15,7 @@ Commands:
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -227,23 +228,80 @@ def _resolve_include_vendor(target_dir, args) -> bool:
     return answer in ("y", "yes")
 
 
-def cmd_docs(args):
-    """Run docs generation pipeline only (Phases 1-6)."""
-    _check_config()
-    target_dir = args.target_dir
-    if not os.path.isdir(target_dir):
-        print(f"Error: Directory not found: {target_dir}")
+# ── Multi-repo helpers ────────────────────────────────────────────
+
+def _resolve_repo_name(target_dir, args) -> str:
+    """Repo name for a target: --repo-name if given, else the dir basename."""
+    name = getattr(args, "repo_name", None)
+    if name:
+        return name
+    return os.path.basename(os.path.abspath(target_dir).rstrip(os.sep)) or "repo"
+
+
+@contextlib.contextmanager
+def _repo_output_dir(repo):
+    """Isolate a repo's checkpoints/outputs under OUTPUT_DIR/repos/<repo> so
+    repos ingested into the same graph never clobber each other's state."""
+    base = config.OUTPUT_DIR
+    config.OUTPUT_DIR = os.path.join(base, "repos", repo)
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    try:
+        yield
+    finally:
+        config.OUTPUT_DIR = base
+
+
+def _load_repos_manifest(path):
+    """Parse a --repos manifest: a JSON list of {name?, path, include_vendor?}
+    (bare path strings also accepted). Returns [(name, abs_path, include_vendor)]."""
+    with open(path, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+    out = []
+    for e in entries:
+        if isinstance(e, str):
+            p = e
+            name, inc = None, None
+        else:
+            p = e["path"]
+            name = e.get("name")
+            inc = e.get("include_vendor")
+        p_abs = os.path.abspath(p)
+        name = name or os.path.basename(p_abs.rstrip(os.sep)) or "repo"
+        out.append((name, p_abs, inc))
+    return out
+
+
+def _iter_repos(args):
+    """Yield (repo_name, abs_path, include_vendor) for a command — either the
+    single positional target or each entry of a --repos manifest."""
+    if getattr(args, "repos", None):
+        for name, path, inc in _load_repos_manifest(args.repos):
+            if inc is None:
+                inc = _resolve_include_vendor(path, args)
+            yield name, path, inc
+        return
+    target = getattr(args, "target_dir", None)
+    if not target:
+        print("Error: provide a target directory, or --repos <manifest.json>")
         sys.exit(1)
+    yield (_resolve_repo_name(target, args), os.path.abspath(target),
+           _resolve_include_vendor(target, args))
 
-    include_vendor = _resolve_include_vendor(target_dir, args)
-    _print_banner("Docs Generation (Phases 1-6)", target_dir)
-    total_start = time.time()
-    data = asyncio.run(run_docs_pipeline(target_dir, include_vendor=include_vendor))
-    total_elapsed = time.time() - total_start
-    _print_timing_report(data, total_elapsed)
 
-    # Save data for graph pipeline to pick up
-    _save_pipeline_data(data)
+def cmd_docs(args):
+    """Run docs generation pipeline only (Phases 1-6), per repo."""
+    _check_config()
+    for repo, target_dir, include_vendor in _iter_repos(args):
+        if not os.path.isdir(target_dir):
+            print(f"Error: Directory not found: {target_dir}")
+            sys.exit(1)
+        with _repo_output_dir(repo):
+            _print_banner(f"Docs Generation (repo: {repo})", target_dir)
+            total_start = time.time()
+            data = asyncio.run(run_docs_pipeline(
+                target_dir, include_vendor=include_vendor, repo=repo))
+            _print_timing_report(data, time.time() - total_start)
+            _save_pipeline_data(data)  # for a later `generate graph`
 
 
 def cmd_graph(args):
@@ -256,36 +314,38 @@ def cmd_graph(args):
     _check_config()
     from .pipeline import phase1_scan, phase1b_treesitter_entities, _load_summaries_from_disk
 
-    target_dir = args.target_dir
-    if not os.path.isdir(target_dir):
-        print(f"Error: Directory not found: {target_dir}")
-        sys.exit(1)
+    for repo, target_dir, include_vendor in _iter_repos(args):
+        if not os.path.isdir(target_dir):
+            print(f"Error: Directory not found: {target_dir}")
+            sys.exit(1)
+        with _repo_output_dir(repo):
+            print("=" * 70)
+            print("  CodeDoc — Graph Generation")
+            print("=" * 70)
+            print(f"  Repo:     {repo}")
+            print(f"  Target:   {target_dir}")
+            print(f"  Spanner:  {config.SPANNER_INSTANCE}/{config.SPANNER_DATABASE}")
+            print("=" * 70)
 
-    print("=" * 70)
-    print("  CodeDoc — Graph Generation")
-    print("=" * 70)
-    print(f"  Target:   {os.path.abspath(target_dir)}")
-    print(f"  Spanner:  {config.SPANNER_INSTANCE}/{config.SPANNER_DATABASE}")
-    print("=" * 70)
+            total_start = time.time()
+            data = _load_pipeline_data(target_dir)
+            if data is not None:
+                if not data.repo:
+                    data.repo = repo
+                print(f"  Loaded saved pipeline data ({len(data.file_summaries)} summaries, "
+                      f"{len(data.extracted_entities)} entities)")
+            else:
+                print("  No saved pipeline data — running scan + tree-sitter...")
+                data = PipelineData(target_dir=target_dir)
+                data.repo = repo
+                data.include_vendor = include_vendor
+                phase1_scan(data)
+                phase1b_treesitter_entities(data)
+                _load_summaries_from_disk(data)
 
-    total_start = time.time()
-
-    data = _load_pipeline_data(target_dir)
-    if data is not None:
-        print(f"  Loaded saved pipeline data ({len(data.file_summaries)} summaries, "
-              f"{len(data.extracted_entities)} entities)")
-    else:
-        print("  No saved pipeline data — running scan + tree-sitter...")
-        data = PipelineData(target_dir=os.path.abspath(target_dir))
-        data.include_vendor = _resolve_include_vendor(target_dir, args)
-        phase1_scan(data)
-        phase1b_treesitter_entities(data)
-        _load_summaries_from_disk(data)
-
-    print()
-    run_graph_pipeline(data)
-    total_elapsed = time.time() - total_start
-    _print_timing_report(data, total_elapsed)
+            print()
+            run_graph_pipeline(data)
+            _print_timing_report(data, time.time() - total_start)
 
 
 def cmd_run(args):
@@ -309,12 +369,20 @@ def cmd_upload_graph(args):
 
 
 def cmd_analyze(args):
-    """Run full pipeline: docs + graph."""
-    cmd_docs(args)
-    data = _load_pipeline_data(args.target_dir)
-    if data:
-        run_graph_pipeline(data)
-        _print_timing_report(data, time.time())
+    """Run full pipeline (docs + graph) for each repo, into the shared graph."""
+    _check_config()
+    for repo, target_dir, include_vendor in _iter_repos(args):
+        if not os.path.isdir(target_dir):
+            print(f"Error: Directory not found: {target_dir}")
+            sys.exit(1)
+        with _repo_output_dir(repo):
+            _print_banner(f"Full Pipeline (repo: {repo})", target_dir)
+            total_start = time.time()
+            data = asyncio.run(run_docs_pipeline(
+                target_dir, include_vendor=include_vendor, repo=repo))
+            _save_pipeline_data(data)
+            run_graph_pipeline(data)
+            _print_timing_report(data, time.time() - total_start)
 
 
 def cmd_setup_spanner(args):
@@ -377,6 +445,17 @@ def cmd_validate(args):
             rows = list(snap.execute_sql(f"SELECT COUNT(*) FROM {table}"))
             count = rows[0][0] if rows else 0
             print(f"  {table:<25} {count:>10,}")
+
+    # Per-repo node counts — surfaces an accidental cross-repo merge (a repo
+    # missing, or two repos sharing a name) at a glance.
+    print("\n  Nodes by repo:")
+    for table in NODE_TABLES:
+        with db.snapshot() as snap:
+            rows = list(snap.execute_sql(
+                f"SELECT repo, COUNT(*) AS n FROM {table} GROUP BY repo ORDER BY repo"))
+            if rows:
+                summary = ", ".join(f"{r[0] or '(none)'}={r[1]:,}" for r in rows)
+                print(f"  {table:<25} {summary}")
 
     # Check for orphaned edges (both endpoints must resolve to a node). The
     # resolution-driven Phase 9 should make MethodCalls/PossiblyCalls/
@@ -442,23 +521,31 @@ def main():
         p.add_argument("--exclude-vendor", action="store_true",
                        help="Exclude vendor/ files (skip the prompt)")
 
+    def _add_repo_flags(p):
+        # target_dir optional so a run can be driven entirely by --repos manifest
+        p.add_argument("target_dir", nargs="?", help="Source code directory (one repo)")
+        p.add_argument("--repo-name", help="Repository name in the graph (default: dir basename)")
+        p.add_argument("--repos", metavar="MANIFEST",
+                       help="JSON manifest of repos [{name?, path, include_vendor?}] "
+                            "to ingest into the same graph")
+
     # init
     p_init = subparsers.add_parser("init", help="Setup: generate .env configuration")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing .env")
 
     # analyze — full pipeline
     p = subparsers.add_parser("analyze", help="Run full pipeline: docs + graph (Phases 1-10)")
-    p.add_argument("target_dir", help="Source code directory")
+    _add_repo_flags(p)
     _add_vendor_flags(p)
 
     # generate — subcommands
     p_gen = subparsers.add_parser("generate", help="Generate docs or graph")
     gen_sub = p_gen.add_subparsers(dest="gen_command")
     p_gw = gen_sub.add_parser("wiki", help="Generate documentation (Phases 1-6)")
-    p_gw.add_argument("target_dir", help="Source code directory")
+    _add_repo_flags(p_gw)
     _add_vendor_flags(p_gw)
     p_gg = gen_sub.add_parser("graph", help="Generate Spanner graph (Phases 8-10)")
-    p_gg.add_argument("target_dir", help="Source code directory")
+    _add_repo_flags(p_gg)
     _add_vendor_flags(p_gg)
 
     # upload — subcommands

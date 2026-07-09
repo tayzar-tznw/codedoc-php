@@ -49,13 +49,50 @@ def test_cmd_docs_mocked(tmp_path, monkeypatch):
     target = tmp_path / "proj"
     target.mkdir()
 
-    async def fake_docs(target_dir, include_vendor=False):
+    async def fake_docs(target_dir, include_vendor=False, repo=""):
         d = PipelineData(target_dir=str(target))
+        d.repo = repo
         d.timings = {"phase1_scan": 0.1}
         return d
     monkeypatch.setattr(m, "run_docs_pipeline", fake_docs)
-    m.cmd_docs(_args(target_dir=str(target), include_vendor=False, exclude_vendor=True))
-    assert os.path.isfile(m._pipeline_data_path())
+    m.cmd_docs(_args(target_dir=str(target), include_vendor=False,
+                     exclude_vendor=True, repo_name=None, repos=None))
+    # pkl is written under the per-repo output dir (repo defaults to basename)
+    assert os.path.isfile(os.path.join(str(tmp_path / "out"), "repos", "proj",
+                                       "pipeline_data.pkl"))
+
+
+def test_cmd_docs_batch_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "OUTPUT_DIR", str(tmp_path / "out"))
+    (tmp_path / "web").mkdir()
+    (tmp_path / "api").mkdir()
+    manifest = tmp_path / "repos.json"
+    import json as _json
+    manifest.write_text(_json.dumps([
+        {"name": "web", "path": str(tmp_path / "web"), "include_vendor": False},
+        {"name": "api", "path": str(tmp_path / "api"), "include_vendor": False},
+    ]))
+    seen = []
+
+    async def fake_docs(target_dir, include_vendor=False, repo=""):
+        seen.append(repo)
+        d = PipelineData(target_dir=target_dir)
+        d.repo = repo
+        return d
+    monkeypatch.setattr(m, "run_docs_pipeline", fake_docs)
+    m.cmd_docs(_args(target_dir=None, repos=str(manifest),
+                     repo_name=None, include_vendor=False, exclude_vendor=False))
+    assert seen == ["web", "api"]
+    # each repo got its own isolated output dir
+    for r in ("web", "api"):
+        assert os.path.isdir(os.path.join(str(tmp_path / "out"), "repos", r))
+
+
+def test_resolve_repo_name_default_and_flag(tmp_path):
+    d = tmp_path / "myrepo"
+    d.mkdir()
+    assert m._resolve_repo_name(str(d), _args(repo_name=None)) == "myrepo"
+    assert m._resolve_repo_name(str(d), _args(repo_name="custom")) == "custom"
 
 
 def test_cmd_run_mocked(tmp_path, monkeypatch):
@@ -85,7 +122,7 @@ def test_cmd_analyze_mocked(tmp_path, monkeypatch):
     target = tmp_path / "proj"
     target.mkdir()
 
-    async def fake_docs(target_dir, include_vendor=False):
+    async def fake_docs(target_dir, include_vendor=False, repo=""):
         d = PipelineData(target_dir=str(target))
         return d
     monkeypatch.setattr(m, "run_docs_pipeline", fake_docs)

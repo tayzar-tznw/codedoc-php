@@ -6,141 +6,248 @@
     {
       "id": "QA-01",
       "question": "グラフには Billing プラグインの Billing\\Service\\Gateway::charge というメソッドノードが存在しますか?(Shipping 側の同名メソッドとは別ノードになっているはずです)",
-      "check": {"type": "node_exists", "subject": "Billing\\Service\\Gateway::charge"},
-      "expected": ["exists"],
+      "check": {
+        "type": "node_exists",
+        "subject": "Billing\\Service\\Gateway::charge"
+      },
+      "expected": [
+        "exists"
+      ],
       "match": "contains_all"
     },
     {
       "id": "QA-02",
       "question": "App\\Controller\\OrdersController::pay が MethodCalls エッジで呼び出しているメソッドは何ですか?(プラグイン双子のうち Billing 側の Gateway::charge だけに解決されるはずです)",
-      "check": {"type": "callees_of", "subject": "App\\Controller\\OrdersController::pay"},
-      "expected": ["Billing\\Service\\Gateway::charge"],
+      "check": {
+        "type": "callees_of",
+        "subject": "App\\Controller\\OrdersController::pay"
+      },
+      "expected": [
+        "Billing\\Service\\Gateway::charge"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-03",
       "question": "App\\Controller\\OrdersController::ship が MethodCalls エッジで呼び出しているメソッドは何ですか?(こちらは Shipping 側の Gateway::charge だけのはずです)",
-      "check": {"type": "callees_of", "subject": "App\\Controller\\OrdersController::ship"},
-      "expected": ["Shipping\\Service\\Gateway::charge"],
+      "check": {
+        "type": "callees_of",
+        "subject": "App\\Controller\\OrdersController::ship"
+      },
+      "expected": [
+        "Shipping\\Service\\Gateway::charge"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-04",
       "question": "Billing\\Service\\Gateway::charge を呼び出しているメソッド(callers)をすべて挙げてください。",
-      "check": {"type": "callers_of", "subject": "Billing\\Service\\Gateway::charge"},
-      "expected": ["App\\Controller\\OrdersController::pay", "App\\Service\\PaymentRunner::settle"],
+      "check": {
+        "type": "callers_of",
+        "subject": "Billing\\Service\\Gateway::charge"
+      },
+      "expected": [
+        "App\\Controller\\OrdersController::pay",
+        "App\\Service\\PaymentRunner::settle"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-05",
       "question": "Shipping\\Service\\Gateway::charge を呼び出しているメソッド(callers)をすべて挙げてください。",
-      "check": {"type": "callers_of", "subject": "Shipping\\Service\\Gateway::charge"},
-      "expected": ["App\\Controller\\OrdersController::ship", "App\\Service\\DispatchRunner::settle"],
+      "check": {
+        "type": "callers_of",
+        "subject": "Shipping\\Service\\Gateway::charge"
+      },
+      "expected": [
+        "App\\Controller\\OrdersController::ship",
+        "App\\Service\\DispatchRunner::settle"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-06",
       "question": "App\\Service\\AppUtilityConsumer::makeSlug の呼び出し先はどのメソッドに解決されますか?(ベンダーの Cake\\Utility\\Text ではなく、アプリ側で影を作っている App\\Utility\\Text::slug のはずです)",
-      "check": {"type": "callees_of", "subject": "App\\Service\\AppUtilityConsumer::makeSlug"},
-      "expected": ["App\\Utility\\Text::slug"],
+      "check": {
+        "type": "callees_of",
+        "subject": "App\\Service\\AppUtilityConsumer::makeSlug"
+      },
+      "expected": [
+        "App\\Utility\\Text::slug"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-07",
       "question": "App\\Utility\\Hash::get の呼び出し元はどのメソッドですか?(ベンダーには 'get' という定義が多数ありますが、アプリ側 Hash::get への MethodCalls エッジは 1 本だけのはずです)",
-      "check": {"type": "callers_of", "subject": "App\\Utility\\Hash::get"},
-      "expected": ["App\\Service\\AppUtilityConsumer::readSetting"],
+      "check": {
+        "type": "callers_of",
+        "subject": "App\\Utility\\Hash::get"
+      },
+      "expected": [
+        "App\\Service\\AppUtilityConsumer::readSetting"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-08",
       "question": "App\\Service\\AppUtilityConsumer::fetchStatus はどのメソッドを呼び出しますか?(ベンダーの Cake\\Http\\Client::get ではなくアプリ側 App\\Http\\Client::get に解決されるはずです)",
-      "check": {"type": "callees_of", "subject": "App\\Service\\AppUtilityConsumer::fetchStatus"},
-      "expected": ["App\\Http\\Client::get"],
+      "check": {
+        "type": "callees_of",
+        "subject": "App\\Service\\AppUtilityConsumer::fetchStatus"
+      },
+      "expected": [
+        "App\\Http\\Client::get"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-09",
       "question": "App\\Controller\\ArticlesController::edit から CakePHP の文字列規約(ビヘイビアのミックスインとコンポーネントのチェーン)経由で張られる MethodCalls エッジの行き先をすべて挙げてください。",
-      "check": {"type": "callees_of", "subject": "App\\Controller\\ArticlesController::edit"},
-      "expected": ["Billing\\Model\\Behavior\\AuditBehavior::auditTrail", "Billing\\Controller\\Component\\PaymentComponent::capture"],
+      "check": {
+        "type": "callees_of",
+        "subject": "App\\Controller\\ArticlesController::edit"
+      },
+      "expected": [
+        "Billing\\Model\\Behavior\\AuditBehavior::auditTrail",
+        "Billing\\Controller\\Component\\PaymentComponent::capture"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-10",
       "question": "App\\Service\\ReportService::invoiceBadge はエンティティの仮想フィールド規約経由でどのメソッドを呼び出しますか?(Invoice の _getTotalLabel アクセサに解決されるはずです)",
-      "check": {"type": "callees_of", "subject": "App\\Service\\ReportService::invoiceBadge"},
-      "expected": ["Billing\\Model\\Entity\\Invoice::_getTotalLabel"],
+      "check": {
+        "type": "callees_of",
+        "subject": "App\\Service\\ReportService::invoiceBadge"
+      },
+      "expected": [
+        "Billing\\Model\\Entity\\Invoice::_getTotalLabel"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-11",
       "question": "動的な可変関数呼び出しを含む App\\Console\\Installer::setFolderPermissions には PossiblyCalls エッジが 1 本もないことを確認してください(dynamic サイトは推測エッジを一切生成しない方針です)。",
-      "check": {"type": "possibly_callees_of", "subject": "App\\Console\\Installer::setFolderPermissions"},
+      "check": {
+        "type": "possibly_callees_of",
+        "subject": "App\\Console\\Installer::setFolderPermissions"
+      },
       "expected": [],
       "match": "exact_set"
     },
     {
       "id": "QA-12",
       "question": "App\\Controller\\ArticlesController の親クラス(ClassInherits)は何ですか?",
-      "check": {"type": "parents_of", "subject": "App\\Controller\\ArticlesController"},
-      "expected": ["App\\Controller\\AppController"],
+      "check": {
+        "type": "parents_of",
+        "subject": "App\\Controller\\ArticlesController"
+      },
+      "expected": [
+        "App\\Controller\\AppController"
+      ],
       "match": "equals"
     },
     {
       "id": "QA-13",
       "question": "App\\Controller\\AppController を継承しているコントローラ(children)をすべて挙げてください。",
-      "check": {"type": "children_of", "subject": "App\\Controller\\AppController"},
-      "expected": ["App\\Controller\\ArticlesController", "App\\Controller\\ErrorController", "App\\Controller\\OrdersController", "App\\Controller\\PagesController"],
+      "check": {
+        "type": "children_of",
+        "subject": "App\\Controller\\AppController"
+      },
+      "expected": [
+        "App\\Controller\\ArticlesController",
+        "App\\Controller\\ErrorController",
+        "App\\Controller\\OrdersController",
+        "App\\Controller\\PagesController"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-14",
       "question": "App\\Model\\Table\\ArticlesTable が定義しているメソッドをすべて挙げてください(フレームワークが名前で呼ぶ beforeSave コールバックも含まれるはずです)。",
-      "check": {"type": "methods_of", "subject": "App\\Model\\Table\\ArticlesTable"},
-      "expected": ["beforeSave", "findRecent", "initialize"],
+      "check": {
+        "type": "methods_of",
+        "subject": "App\\Model\\Table\\ArticlesTable"
+      },
+      "expected": [
+        "beforeSave",
+        "findRecent",
+        "initialize"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-15",
       "question": "ベンダーの Cake\\Utility\\Text を影で覆うアプリ側クラス App\\Utility\\Text はどのファイルで定義されていますか?",
-      "check": {"type": "class_file", "subject": "App\\Utility\\Text"},
-      "expected": ["src/Utility/Text.php"],
+      "check": {
+        "type": "class_file",
+        "subject": "App\\Utility\\Text"
+      },
+      "expected": [
+        "src/Utility/Text.php"
+      ],
       "match": "equals"
     },
     {
       "id": "QA-16",
       "question": "Billing\\Service\\Gateway はどのファイルで定義されていますか?(Shipping 側の双子とはファイルで区別されるはずです)",
-      "check": {"type": "class_file", "subject": "Billing\\Service\\Gateway"},
-      "expected": ["plugins/Billing/src/Service/Gateway.php"],
+      "check": {
+        "type": "class_file",
+        "subject": "Billing\\Service\\Gateway"
+      },
+      "expected": [
+        "plugins/Billing/src/Service/Gateway.php"
+      ],
       "match": "equals"
     },
     {
       "id": "QA-17",
       "question": "src/Controller/OrdersController.php が FileImports エッジで取り込んでいるファイルをすべて挙げてください(Billing と Shipping 両プラグインの Gateway.php のはずです)。",
-      "check": {"type": "imports_of", "subject": "src/Controller/OrdersController.php"},
-      "expected": ["plugins/Billing/src/Service/Gateway.php", "plugins/Shipping/src/Service/Gateway.php"],
+      "check": {
+        "type": "imports_of",
+        "subject": "src/Controller/OrdersController.php"
+      },
+      "expected": [
+        "plugins/Billing/src/Service/Gateway.php",
+        "plugins/Shipping/src/Service/Gateway.php"
+      ],
       "match": "exact_set"
     },
     {
       "id": "QA-18",
-      "question": "App\\Model\\Table\\ArticlesTable は ClassMapsToTable エッジでどの DB テーブルノードに対応付けられていますか?(articles テーブル、ノード ID は a_bc515fd0bf8d28fd のはずです)",
-      "check": {"type": "class_table", "subject": "App\\Model\\Table\\ArticlesTable"},
-      "expected": ["a_bc515fd0bf8d28fd"],
+      "question": "App\\Model\\Table\\ArticlesTable は ClassMapsToTable エッジでどの DB テーブルに対応付けられていますか?",
+      "check": {
+        "type": "class_table",
+        "subject": "App\\Model\\Table\\ArticlesTable"
+      },
+      "expected": [
+        "articles"
+      ],
       "match": "equals"
     },
     {
       "id": "QA-19",
-      "question": "Billing プラグインの Billing\\Model\\Table\\InvoicesTable はどの DB テーブルノードに対応付けられていますか?(プラグインのマイグレーション由来の invoices テーブル、ノード ID は a_bb4eba1a87871a61 のはずです)",
-      "check": {"type": "class_table", "subject": "Billing\\Model\\Table\\InvoicesTable"},
-      "expected": ["a_bb4eba1a87871a61"],
+      "question": "Billing プラグインの Billing\\Model\\Table\\InvoicesTable はどの DB テーブルに対応付けられていますか?(プラグインのマイグレーション由来)",
+      "check": {
+        "type": "class_table",
+        "subject": "Billing\\Model\\Table\\InvoicesTable"
+      },
+      "expected": [
+        "invoices"
+      ],
       "match": "equals"
     },
     {
       "id": "QA-20",
-      "question": "articles テーブル(ノード ID a_bc515fd0bf8d28fd)の外部キー参照(TableReferences)を挙げてください。articles.user_id が users.id を参照するので、参照先カラム id と users テーブルのノード ID a_8e461a3d32b13d6e の組で報告されるはずです。",
-      "check": {"type": "table_fks", "subject": "a_bc515fd0bf8d28fd"},
-      "expected": ["id->a_8e461a3d32b13d6e"],
+      "question": "articles テーブルの外部キー参照(TableReferences)を挙げてください。articles.user_id が users.id を参照するはずです。",
+      "check": {
+        "type": "table_fks",
+        "subject": "articles"
+      },
+      "expected": [
+        "user_id->users"
+      ],
       "match": "exact_set"
     }
   ]

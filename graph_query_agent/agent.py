@@ -88,52 +88,68 @@ graph_agent = Agent(
 
 GQLクエリは必ず `GRAPH {GRAPH_NAME}` で始めてください。
 
+## 重要: リポジトリと厳密な同一性
+全ノードは `repo` プロパティ(所属リポジトリ名)を持ちます。複数リポジトリが
+同一グラフに同居し、**同名メソッド・同名クラスも repo ごとに別ノード**です。
+特定リポジトリに絞るときは常に `WHERE n.repo = '<repo>'` を付けてください。
+メソッドは `fqmn`(例 `App\\Model\\Table\\UsersTable::save`)、クラスは `fqcn` で
+一意に識別できます — 単純名(name)は repo・namespace 間で重複し得ます。
+
 ## ノードラベル
-- Files (file_id, file_name, extension, directory, summary)
-- Classes (class_id, name, file_id, kind, modifiers, summary)
-- Methods (method_id, name, class_id, file_id, signature, modifiers, return_type)
-- Modules (module_id, name, summary)
-- Directories (dir_id, name, summary)
+- Files (file_id, file_name, extension, directory, path, origin, repo, summary)
+- Classes (class_id, name, namespace, fqcn, file_id, kind, modifiers, start_line, end_line, origin, repo, summary)
+- Methods (method_id, name, class_id, file_id, fqmn, signature, modifiers, return_type, start_line, end_line, origin, repo, summary)
+- Modules (module_id, name, repo, summary)
+- Directories (dir_id, name, repo, summary)
+- DbTables (table_id, name, columns[JSON], indexes[JSON], foreign_keys[JSON], source_file, plugin, repo, summary)
 
 ## エッジラベル
+- FileImports: (source_file) → (target) — 解決済み use インポート
 - FileDependsOn: (source_file) → (target_file)
-- ClassInherits: (child_class) → (parent_class)
-- MethodCalls: (caller_method) → (callee_method)
+- ClassInherits: (child_class) → (parent_class)  ※ kind = extends|implements|uses
+- MethodCalls: (caller_method) → (callee_method)  ※ resolution = lsp|convention:<rule>(解決済みのみ)
+- PossiblyCalls: (caller_method) → (callee_method)  ※ reason = ambiguous|dynamic|name-heuristic(未確定の候補)
 - FileDefinesClass: (file_id) → (class_id)
 - ClassDefinesMethod: (class_id) → (method_id)
 - FileBelongsToModule: (file_id) → (module_id)
 - DirContainsFile: (dir_id) → (file_id)
+- TableReferences: (source_table) → (target_table)  ※ 外部キー(fk_column, referenced_column)
+- ClassMapsToTable: (class_id) → (table_id)  ※ CakePHP Table クラス→DBテーブル(via = settable|convention)
+
+確定した呼び出しは MethodCalls、未確定は PossiblyCalls です。厳密な呼び出し関係が
+必要なときは MethodCalls を、可能性を広く見たいときは PossiblyCalls も併用してください。
 
 ## クエリ例
 
-### 依存ファイル:
+### 依存ファイル(特定リポジトリ内):
 GRAPH {GRAPH_NAME}
 MATCH (dep:Files)-[e:FileDependsOn]->(f:Files)
-WHERE f.file_name = 'UsersController.php'
-RETURN dep.file_name
+WHERE f.file_name = 'UsersController.php' AND f.repo = 'web'
+RETURN dep.file_name, dep.repo
 
-### クラス継承 (直接+間接):
+### メソッドの確定した呼び出し先(FQMNで一意特定):
+GRAPH {GRAPH_NAME}
+MATCH (caller:Methods)-[e:MethodCalls]->(callee:Methods)
+WHERE caller.fqmn = 'App\\Controller\\UsersController::index'
+RETURN callee.fqmn, e.resolution
+
+### クラス継承 (直接+間接、リポジトリ内):
 GRAPH {GRAPH_NAME}
 MATCH (child:Classes)-[i:ClassInherits]->{{1,5}}(ancestor:Classes)
-WHERE ancestor.name = 'AppController'
-RETURN child.name
+WHERE ancestor.name = 'AppController' AND ancestor.repo = 'web'
+RETURN child.fqcn
 
-### メソッド一覧:
+### Table クラスが対応する DB テーブル:
 GRAPH {GRAPH_NAME}
-MATCH (c:Classes)-[d:ClassDefinesMethod]->(m:Methods)
-WHERE c.name = 'UsersController'
-RETURN m.name, m.signature
+MATCH (c:Classes)-[m:ClassMapsToTable]->(t:DbTables)
+WHERE c.name = 'UsersTable' AND c.repo = 'web'
+RETURN t.name, m.via
 
-### 変更影響分析:
+### 同名メソッドがどのリポジトリに存在するか:
 GRAPH {GRAPH_NAME}
-MATCH (affected:Files)-[e:FileDependsOn]->{{1,3}}(f:Files)
-WHERE f.file_name = 'UsersController.php'
-RETURN DISTINCT affected.file_name
-
-### 循環依存:
-GRAPH {GRAPH_NAME}
-MATCH (a:Files)-[e:FileDependsOn]->{{2,10}}(a)
-RETURN DISTINCT a.file_name
+MATCH (m:Methods)
+WHERE m.name = 'save'
+RETURN m.repo, m.fqmn
 
 日本語で回答してください。""",
     tools=[run_gql_query],

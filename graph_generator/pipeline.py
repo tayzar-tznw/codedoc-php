@@ -68,6 +68,11 @@ class PipelineData:
     file_origins: dict[str, str] = field(default_factory=dict)
     include_vendor: bool = False
 
+    # Multi-repo: the repository this run belongs to. Every node ID is scoped by
+    # it so identical relpath+FQCN in different repos stay distinct nodes in one
+    # shared graph. Defaults to the target directory basename (set in phase1_scan).
+    repo: str = ""
+
     # Phase 1.7 DB schema (from Phinx migrations): {"tables": {...}, "warnings": [...]}
     db_schema: dict[str, Any] = field(default_factory=dict)
     dbtable_id_map: dict[str, str] = field(default_factory=dict)
@@ -121,9 +126,10 @@ def _log_error(msg: str):
 _CHUNK_CHARS = 800_000  # ~200K tokens normal code, ~267K for data-dense — safe under 1M
 
 # Node/edge ID scheme version. Bump when _make_id inputs change shape (e.g. the
-# switch to target-relative paths + FQCN keys) so resumed graph checkpoints from
-# an older scheme are discarded instead of mixing incompatible IDs.
-ID_SCHEME = 2
+# switch to target-relative paths + FQCN keys, or adding the repo dimension) so
+# resumed graph checkpoints from an older scheme are discarded instead of mixing
+# incompatible IDs.
+ID_SCHEME = 3
 
 
 def _read_source_file(file_path: str) -> str:
@@ -644,6 +650,8 @@ def phase1_scan(data: PipelineData):
     t0 = time.time()
     abs_path = os.path.abspath(data.target_dir)
     data.target_dir = abs_path
+    if not data.repo:
+        data.repo = os.path.basename(abs_path.rstrip(os.sep)) or "repo"
 
     # vendor/ is skipped by default; including it keeps vendor files in the
     # scan (tagged origin='vendor') for graph nodes/edges + LSP resolution.
@@ -1780,6 +1788,8 @@ def build_node_rows(data: PipelineData) -> dict[str, Any]:
         return os.path.relpath(p, target) if target else p
 
     origins = data.file_origins or {}
+    repo = data.repo  # every node ID is scoped by repo so identical relpath+FQCN
+                      # in different repos never merge; also stored as a column.
 
     rows: dict[str, list[list]] = {t: [] for t in NODE_COLUMNS}
     file_id_map: dict[str, str] = {}
@@ -1790,12 +1800,12 @@ def build_node_rows(data: PipelineData) -> dict[str, Any]:
 
     for fp in data.file_list:
         rel = _rel(fp)
-        fid = _make_id("file", rel)
+        fid = _make_id("file", repo, rel)
         file_id_map[fp] = fid
         origin = origins.get(rel, "app")
         summary = data.file_summaries.get(fp, "")
         rows["Files"].append([fid, os.path.basename(fp), os.path.splitext(fp)[1],
-                              os.path.dirname(rel), rel, origin, summary[:4000]])
+                              os.path.dirname(rel), rel, origin, summary[:4000], repo])
 
     for fp, ent in data.extracted_entities.items():
         rel = _rel(fp)
@@ -1806,20 +1816,20 @@ def build_node_rows(data: PipelineData) -> dict[str, Any]:
             if not cname:
                 continue
             fqcn = cls.get("fqcn") or ""
-            cid = _make_id("class", rel, fqcn or cname)
+            cid = _make_id("class", repo, rel, fqcn or cname)
             class_id_map[f"{fp}|{cname}"] = cid
             rows["Classes"].append([
                 cid, cname, namespace, fqcn, file_id_map.get(fp, ""),
                 cls.get("kind", "class"), cls.get("modifiers", ""),
                 cls.get("start_line", 0), cls.get("end_line", 0), origin,
-                f"{fqcn or cname}: {cls.get('kind', 'class')}",
+                f"{fqcn or cname}: {cls.get('kind', 'class')}", repo,
             ])
             for meth in cls.get("methods", []):
                 mname = meth.get("name", "")
                 if not mname:
                     continue
                 fqmn = _member_fqmn(cls, meth, namespace)
-                mid = _make_id("method", rel, fqcn or cname, mname)
+                mid = _make_id("method", repo, rel, fqcn or cname, mname)
                 method_id_map[f"{fp}|{cname}|{mname}"] = mid
                 sig = (f"{meth.get('return_type', 'void')} {cname}.{mname}"
                        f"({meth.get('parameters', '')})")
@@ -1827,28 +1837,28 @@ def build_node_rows(data: PipelineData) -> dict[str, Any]:
                     mid, mname, cid, file_id_map.get(fp, ""), fqmn, sig,
                     meth.get("modifiers", ""), meth.get("return_type", ""),
                     meth.get("start_line", 0), meth.get("end_line", 0), origin,
-                    fqmn,
+                    fqmn, repo,
                 ])
 
     for topic in data.topics:
         tname = topic.get("name", "")
         if not tname:
             continue
-        tid = _make_id("module", tname)
+        tid = _make_id("module", repo, tname)
         module_id_map[tname] = tid
         rows["Modules"].append([tid, tname,
-                                data.topic_summaries.get(tname, "")[:4000]])
+                                data.topic_summaries.get(tname, "")[:4000], repo])
 
     for dp in data.dir_queue:
-        did = _make_id("dir", _rel(dp))
+        did = _make_id("dir", repo, _rel(dp))
         dir_id_map[dp] = did
         rows["Directories"].append([did, os.path.basename(dp),
-                                    data.dir_summaries.get(dp, "")[:4000]])
+                                    data.dir_summaries.get(dp, "")[:4000], repo])
 
     # -- DbTables (from Phase 1.7 migration schema) --
     dbtable_id_map: dict[str, str] = {}
     for tname, tbl in (data.db_schema or {}).get("tables", {}).items():
-        tid = _make_id("dbtable", tname)
+        tid = _make_id("dbtable", repo, tname)
         dbtable_id_map[tname] = tid
         src = tbl.get("source_file", "")
         plugin = ""
@@ -1863,7 +1873,7 @@ def build_node_rows(data: PipelineData) -> dict[str, Any]:
             json.dumps(tbl.get("indexes", []), ensure_ascii=False),
             json.dumps(tbl.get("foreign_keys", []), ensure_ascii=False),
             src, plugin,
-            f"{tname}: {len(tbl.get('columns', []))} columns",
+            f"{tname}: {len(tbl.get('columns', []))} columns", repo,
         ])
 
     return {
@@ -2427,7 +2437,8 @@ def phase10_generate_embeddings(data: PipelineData):
 # ===================================================================
 
 
-async def run_docs_pipeline(target_dir: str, include_vendor: bool = False) -> PipelineData:
+async def run_docs_pipeline(target_dir: str, include_vendor: bool = False,
+                            repo: str = "") -> PipelineData:
     """Run documentation generation pipeline (Phases 1-6)."""
     client = genai.Client(
         vertexai=True,
@@ -2436,6 +2447,7 @@ async def run_docs_pipeline(target_dir: str, include_vendor: bool = False) -> Pi
     )
     data = PipelineData(target_dir=os.path.abspath(target_dir))
     data.include_vendor = include_vendor
+    data.repo = repo
 
     phase1_scan(data)
     phase1b_treesitter_entities(data)
@@ -2534,8 +2546,9 @@ def run_graph_pipeline(data: PipelineData):
         _print(f"[Resume] Skipping Phase 10 (already completed)")
 
 
-async def run_pipeline(target_dir: str, include_vendor: bool = False) -> PipelineData:
+async def run_pipeline(target_dir: str, include_vendor: bool = False,
+                       repo: str = "") -> PipelineData:
     """Run full pipeline: docs + graph (Phases 1-10)."""
-    data = await run_docs_pipeline(target_dir, include_vendor=include_vendor)
+    data = await run_docs_pipeline(target_dir, include_vendor=include_vendor, repo=repo)
     run_graph_pipeline(data)
     return data

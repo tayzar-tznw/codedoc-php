@@ -72,13 +72,20 @@ def test_cmd_evaluate_exit_code(monkeypatch):
 
 def test_cmd_validate_with_fake_db(monkeypatch, capsys):
     from tests.conftest import FakeSpannerDb
-    db = FakeSpannerDb(sql_rows={"COUNT(*)": [[3]]})
+    # GROUP BY repo marker must precede the plain COUNT(*) marker (the group
+    # query contains both substrings; first match wins).
+    db = FakeSpannerDb(sql_rows={
+        "GROUP BY repo": [["web", 10], ["api", 7]],
+        "COUNT(*)": [[3]],
+    })
     monkeypatch.setattr(m, "_get_spanner_db", lambda: db)
     m.cmd_validate(_args())
     out = capsys.readouterr().out
     assert "GRAPH VALIDATION" in out
     assert "Files" in out and "MethodCalls" in out
     assert "Orphan checks" in out
+    assert "Nodes by repo" in out
+    assert "web=10" in out and "api=7" in out
 
 
 def test_load_pipeline_data_backfills_missing_fields(tmp_path, monkeypatch):
