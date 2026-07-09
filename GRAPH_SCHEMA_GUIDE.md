@@ -500,9 +500,9 @@ RETURN t.name, r.fk_column, ref.name;
 | ID プレフィックス | `a` | `ID_PREFIX` |
 | プロジェクト | config 既定値 | `GOOGLE_CLOUD_PROJECT` |
 
-> 実際の環境では `.env` でこれらが上書きされている。本リポジトリの `.env` の実値は **プロジェクト `codedoc-php` / インスタンス `codedoc` / データベース `codedoc-php` / グラフ `code_graph_a`**。グラフ名やプロジェクトは、まず `.env` / 環境変数の実値を確認すること。
+> 実際の環境では `.env` でこれらが上書きされる。本リポジトリの `.env` では **インスタンス `codedoc` / データベース `codedoc-php` / グラフ `code_graph_a`** を使用（プロジェクト ID は環境ごとに異なるため、値はハードコードせず必ず `.env` / 環境変数の実値を確認すること）。
 
-`gcloud` から1発で叩く例（上記 `.env` の実値を使用）:
+`gcloud` から1発で叩く例（`.env` の実値に合わせる。プロジェクトは `gcloud config` の既定を使用）:
 
 ```bash
 gcloud spanner databases execute-sql codedoc-php \
