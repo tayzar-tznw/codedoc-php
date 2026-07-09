@@ -2,7 +2,16 @@
 
 Supports PHP (the full grammar, including HTML interleaving in CakePHP
 templates) with exact same output schema as the LLM entity extraction prompt.
-Returns None for unsupported languages so the caller can fall back to LLM.
+Returns None for unsupported extensions or unparseable files — the caller then
+skips entity extraction for that file (chunking falls back to character-based).
+
+Schema v2 (ENTITIES_VERSION = 2) adds resolution inputs on top of the v1
+fields, all additive: per-class `fqcn`/`start_line`/`end_line`/`heritage`,
+per-member `member_kind`/`start_line`/`end_line`, per-method `param_types`/
+`call_sites`/`prop_sites`/`class_refs`/`assignments`, and file-level
+structured `uses`. Positions are 1-based lines and 0-based UTF-16 code-unit
+columns (the LSP wire format — tree-sitter's byte columns shift on lines
+containing multibyte text, so the conversion happens here, once).
 """
 
 from __future__ import annotations
@@ -11,6 +20,11 @@ import os
 from typing import Any
 
 import tree_sitter as ts
+
+# Version of the entity dict schema produced by parse_entities. Bump when
+# fields change shape; entities.json checkpoints with a different version are
+# discarded and re-parsed.
+ENTITIES_VERSION = 2
 
 # Lazy-loaded language objects
 _languages: dict[str, ts.Language] = {}
@@ -95,16 +109,39 @@ _PHP_INCLUDE_NODES = (
     "require_expression", "require_once_expression",
 )
 
+# Receiver/expression texts are advisory (type-tracker patterns like `$this`
+# or `$this->Users`); cap them so chained expressions don't bloat entities.
+_RECEIVER_MAX_CHARS = 160
+
 
 def _php_simple_name(node: ts.Node | None) -> str:
-    """Rightmost segment of a name node: `App\\Model\\Table\\UsersTable` → `UsersTable`.
-
-    Phase 9 matches inheritance/call edges by simple name, so qualified names
-    must be reduced to their final segment.
-    """
+    """Rightmost segment of a name node: `App\\Model\\Table\\UsersTable` → `UsersTable`."""
     if node is None:
         return ""
     return _node_text(node).rsplit("\\", 1)[-1]
+
+
+def _line(node: ts.Node) -> int:
+    """1-based start line of a node."""
+    return node.start_point[0] + 1
+
+
+def _utf16_col(node: ts.Node, source: bytes) -> int:
+    """0-based UTF-16 code-unit column of a node's start (LSP position format).
+
+    tree-sitter reports byte columns; any multibyte text earlier on the line
+    (Japanese comments/strings) would silently shift LSP positions without
+    this conversion.
+    """
+    line_start = node.start_byte - node.start_point[1]
+    prefix = source[line_start:node.start_byte].decode("utf-8", errors="replace")
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in prefix)
+
+
+def _receiver_text(node: ts.Node | None) -> str:
+    if node is None:
+        return ""
+    return _node_text(node)[:_RECEIVER_MAX_CHARS]
 
 
 def _php_modifiers(node: ts.Node) -> str:
@@ -116,34 +153,285 @@ def _php_modifiers(node: ts.Node) -> str:
     return " ".join(mods)
 
 
-def _extract_php_invocations(body_node: ts.Node | None) -> list[str]:
-    """Extract called names from a method/function body.
+def _literal_string(node: ts.Node | None) -> str | None:
+    """Content of a literal (non-interpolated) string node, else None.
 
-    Covers `foo()`, `$obj->foo()`, `$obj?->foo()`, and `Foo::bar()`. Dynamic
-    callees (`$this->$method()`, `$fn()`) have no `name` node and are skipped.
+    Escapes are decoded minimally: `\\\\` → `\\` and the quote escapes —
+    enough for FQCN-bearing strings like 'App\\\\Model\\\\Table\\\\UsersTable'.
+    """
+    if node is None:
+        return None
+    if node.type in ("string", "encapsed_string"):
+        # Single- and double-quoted literals are split into string_content +
+        # escape_sequence children (e.g. 'A\\B' → "A", "\\", "B"). Decode the
+        # backslash/quote escapes so FQCN strings come back whole; bail on
+        # interpolation (variables/expressions), which is not a literal.
+        parts: list[str] = []
+        for c in node.named_children:
+            if c.type == "string_content":
+                parts.append(_node_text(c))
+            elif c.type == "escape_sequence":
+                raw = _node_text(c)
+                parts.append({"\\\\": "\\", "\\\"": '"', "\\'": "'"}.get(raw, raw))
+            else:
+                return None  # interpolation — not a literal
+        return "".join(parts)
+    return None
+
+
+# Strings that look like 'FQCN::method' callables
+_CALLABLE_STRING = None  # compiled lazily to keep import cost nil
+
+
+def _is_callable_string(value: str) -> bool:
+    global _CALLABLE_STRING
+    if _CALLABLE_STRING is None:
+        import re
+        _CALLABLE_STRING = re.compile(r"^\\?[A-Za-z_][\w\\]*::[A-Za-z_]\w*$")
+    return bool(_CALLABLE_STRING.match(value))
+
+
+def _str_args(call_node: ts.Node) -> list[str | None]:
+    """Literal string contents of the first ≤3 arguments (None per non-literal).
+
+    Convention resolution reads these (`fetchTable('Users')`,
+    `addBehavior('Billing.Audit')`); positional Nones keep argument indexes.
+    """
+    args_node = call_node.child_by_field_name("arguments")
+    out: list[str | None] = []
+    if args_node is None:
+        return out
+    for a in args_node.named_children:
+        if a.type != "argument":
+            continue
+        expr = a.named_children[-1] if a.named_children else None
+        out.append(_literal_string(expr))
+        if len(out) == 3:
+            break
+    return out
+
+
+def _extract_member_data(body_node: ts.Node | None, source: bytes) -> dict[str, Any]:
+    """Walk a method/function body collecting calls and resolution inputs.
+
+    Returns legacy `calls` (deduped simple names — unchanged v1 behavior) plus
+    v2 `call_sites`/`prop_sites`/`class_refs`/`assignments` with positions.
+    Calls inside closures are attributed to the enclosing method (as before).
     """
     calls: list[str] = []
+    call_sites: list[dict] = []
+    prop_sites: list[dict] = []
+    class_refs: list[dict] = []
+    assignments: list[dict] = []
 
-    def _walk(node: ts.Node):
+    def _site(name: str, kind: str, pos_node: ts.Node, receiver: str = "",
+              qualified: str = "", call_node: ts.Node | None = None,
+              dynamic: bool = False) -> dict:
+        return {
+            "name": name,
+            "kind": kind,
+            "line": _line(pos_node),
+            "col": _utf16_col(pos_node, source),
+            "receiver": receiver,
+            "qualified": qualified,
+            "str_args": _str_args(call_node) if call_node is not None else [],
+            "dynamic": dynamic,
+        }
+
+    def _call_name_site(node: ts.Node) -> dict | None:
+        """Build a call_site for a call-expression node, or None."""
         t = node.type
         if t == "function_call_expression":
             fn = node.child_by_field_name("function")
             if fn is not None and fn.type in _PHP_NAME_NODES:
-                calls.append(_php_simple_name(fn))
-        elif t in ("member_call_expression", "nullsafe_member_call_expression",
-                   "scoped_call_expression"):
+                full = _node_text(fn)
+                simple = full.rsplit("\\", 1)[-1]
+                return _site(simple, "function", fn,
+                             qualified=full if full != simple else "",
+                             call_node=node)
+            if fn is not None:
+                return _site("", "function", node,
+                             receiver=_receiver_text(fn), call_node=node,
+                             dynamic=True)
+            return None
+        if t in ("member_call_expression", "nullsafe_member_call_expression"):
+            kind = "nullsafe" if t.startswith("nullsafe") else "method"
             name_node = node.child_by_field_name("name")
+            obj = node.child_by_field_name("object")
             if name_node is not None and name_node.type == "name":
-                calls.append(_node_text(name_node))
+                return _site(_node_text(name_node), kind, name_node,
+                             receiver=_receiver_text(obj), call_node=node)
+            return _site("", kind, node, receiver=_receiver_text(obj),
+                         call_node=node, dynamic=True)
+        if t == "scoped_call_expression":
+            name_node = node.child_by_field_name("name")
+            scope = node.child_by_field_name("scope")
+            if name_node is not None and name_node.type == "name":
+                return _site(_node_text(name_node), "static", name_node,
+                             receiver=_receiver_text(scope), call_node=node)
+            return _site("", "static", node, receiver=_receiver_text(scope),
+                         call_node=node, dynamic=True)
+        if t == "object_creation_expression":
+            cname = None
+            for c in node.children:
+                if c.type in _PHP_NAME_NODES:
+                    cname = c
+                    break
+            if cname is not None:
+                full = _node_text(cname)
+                return _site(full.rsplit("\\", 1)[-1], "new", cname,
+                             qualified=full, call_node=node)
+            return None  # anonymous class / `new $cls` — no static target
+        return None
+
+    def _walk(node: ts.Node):
+        t = node.type
+
+        site = _call_name_site(node)
+        if site is not None:
+            call_sites.append(site)
+            # Legacy v1 `calls`: named function/method/static callees only.
+            if site["name"] and site["kind"] in ("function", "method", "nullsafe", "static"):
+                calls.append(site["name"])
+
+        elif t in ("member_access_expression", "nullsafe_member_access_expression"):
+            name_node = node.child_by_field_name("name")
+            obj = node.child_by_field_name("object")
+            if name_node is not None and name_node.type == "name":
+                prop_sites.append({
+                    "receiver": _receiver_text(obj),
+                    "name": _node_text(name_node),
+                    "line": _line(name_node),
+                    "col": _utf16_col(name_node, source),
+                })
+
+        elif t == "class_constant_access_expression":
+            named = node.named_children
+            if len(named) >= 2 and named[-1].type == "name" \
+                    and _node_text(named[-1]) == "class" \
+                    and named[0].type in _PHP_NAME_NODES:
+                class_refs.append({
+                    "text": _node_text(named[0]),
+                    "kind": "class_literal",
+                    "line": _line(named[0]),
+                    "col": _utf16_col(named[0], source),
+                })
+
+        elif t in ("string", "encapsed_string"):
+            # Standalone 'FQCN::method' callable strings (array elements,
+            # assignments, arguments) — PHP resolves them as fully qualified.
+            lit = _literal_string(node)
+            if lit and _is_callable_string(lit):
+                cls_part, member = lit.rsplit("::", 1)
+                class_refs.append({
+                    "text": cls_part,
+                    "kind": "callable_string",
+                    "name": member,
+                    "line": _line(node),
+                    "col": _utf16_col(node, source),
+                })
+
+        elif t == "array_creation_expression":
+            # [$obj, 'method'] callable pairs
+            elems = [c for c in node.named_children
+                     if c.type == "array_element_initializer"]
+            if len(elems) == 2:
+                second = elems[1].named_children[-1] if elems[1].named_children else None
+                lit = _literal_string(second)
+                if lit is not None and elems[0].named_children:
+                    class_refs.append({
+                        "text": _receiver_text(elems[0].named_children[-1]),
+                        "kind": "array_callable",
+                        "name": lit,
+                        "line": _line(node),
+                        "col": _utf16_col(node, source),
+                    })
+
+        elif t == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None and right is not None and left.type == "variable_name":
+                var = _node_text(left)
+                if right.type == "object_creation_expression":
+                    cname = None
+                    for c in right.children:
+                        if c.type in _PHP_NAME_NODES:
+                            cname = c
+                            break
+                    if cname is not None:
+                        assignments.append({
+                            "var": var, "rhs_kind": "new",
+                            "name": _php_simple_name(cname),
+                            "qualified": _node_text(cname),
+                            "line": _line(cname),
+                            "col": _utf16_col(cname, source),
+                        })
+                    else:
+                        # `new $cls()` — runtime class; receiver is dynamic
+                        assignments.append({
+                            "var": var, "rhs_kind": "dynamic",
+                            "line": _line(right),
+                        })
+                elif right.type in ("member_call_expression",
+                                    "nullsafe_member_call_expression",
+                                    "scoped_call_expression",
+                                    "function_call_expression"):
+                    inner = _call_name_site(right)
+                    if inner is not None and inner["name"]:
+                        assignments.append({
+                            "var": var, "rhs_kind": "call",
+                            "name": inner["name"],
+                            "line": inner["line"], "col": inner["col"],
+                        })
+                elif right.type in ("member_access_expression",
+                                    "nullsafe_member_access_expression"):
+                    name_node = right.child_by_field_name("name")
+                    obj = right.child_by_field_name("object")
+                    if name_node is not None and name_node.type == "name":
+                        assignments.append({
+                            "var": var, "rhs_kind": "prop",
+                            "receiver": _receiver_text(obj),
+                            "name": _node_text(name_node),
+                        })
+                elif right.type == "variable_name":
+                    assignments.append({
+                        "var": var, "rhs_kind": "var",
+                        "name": _node_text(right),
+                    })
+
         for child in node.children:
             _walk(child)
 
     if body_node is not None:
         _walk(body_node)
-    return list(dict.fromkeys(calls))  # dedupe preserving order
+
+    return {
+        "calls": list(dict.fromkeys(calls)),  # dedupe preserving order
+        "call_sites": call_sites,
+        "prop_sites": prop_sites,
+        "class_refs": class_refs,
+        "assignments": assignments,
+    }
 
 
-def _extract_php_function(node: ts.Node) -> dict | None:
+def _param_types(params_node: ts.Node | None) -> dict[str, str]:
+    """`$var` → declared type text, for typed (incl. promoted) parameters."""
+    out: dict[str, str] = {}
+    if params_node is None:
+        return out
+    for p in params_node.named_children:
+        if p.type not in ("simple_parameter", "property_promotion_parameter",
+                          "variadic_parameter"):
+            continue
+        tnode = p.child_by_field_name("type")
+        nnode = p.child_by_field_name("name")
+        if tnode is not None and nnode is not None:
+            out[_node_text(nnode)] = _node_text(tnode)
+    return out
+
+
+def _extract_php_function(node: ts.Node, source: bytes,
+                          member_kind: str = "method") -> dict | None:
     """Build a method dict from a `method_declaration` or `function_definition`.
 
     Both node types expose the same fields (name / parameters / return_type /
@@ -159,29 +447,35 @@ def _extract_php_function(node: ts.Node) -> dict | None:
     params = ""
     params_node = node.child_by_field_name("parameters")
     if params_node is not None:
-        params = _node_text(params_node)[1:-1].strip()
+        # Collapse newlines/indentation (multi-line promoted-constructor params
+        # would otherwise flow verbatim into the Methods.signature column).
+        params = " ".join(_node_text(params_node)[1:-1].split()).rstrip(",")
 
     ret_type = ""
     ret_node = node.child_by_field_name("return_type")
     if ret_node is not None:
         ret_type = _node_text(ret_node)
 
-    return {
+    member = {
         "name": name,
         "modifiers": _php_modifiers(node),
         "return_type": ret_type,
         "parameters": params,
-        "calls": _extract_php_invocations(node.child_by_field_name("body")),
+        "member_kind": member_kind,
+        "start_line": _line(node),
+        "end_line": node.end_point[0] + 1,
+        "param_types": _param_types(params_node),
     }
+    member.update(_extract_member_data(node.child_by_field_name("body"), source))
+    return member
 
 
-def _extract_php_properties(node: ts.Node) -> list[dict]:
+def _extract_php_properties(node: ts.Node, source: bytes) -> list[dict]:
     """`property_declaration` → zero-parameter members.
 
-    Mirrors how the graph treats Kotlin properties / Ruby attr_* accessors:
-    properties appear as members so CakePHP entities keep their fields in the
-    graph. `return_type` records the declared type; `calls` captures default
-    values' calls (rare) — kept empty for simplicity.
+    Properties are surfaced as zero-parameter members so CakePHP entities keep
+    their fields in the graph. `return_type` records the declared type; calls
+    in default values (rare) are not extracted, so `calls` stays empty.
     """
     mods = _php_modifiers(node)
     type_node = node.child_by_field_name("type")
@@ -206,12 +500,20 @@ def _extract_php_properties(node: ts.Node) -> list[dict]:
                 "modifiers": mods,
                 "return_type": ptype,
                 "parameters": "",
+                "member_kind": "property",
+                "start_line": _line(node),
+                "end_line": node.end_point[0] + 1,
+                "param_types": {},
                 "calls": [],
+                "call_sites": [],
+                "prop_sites": [],
+                "class_refs": [],
+                "assignments": [],
             })
     return out
 
 
-def _process_php_type(node: ts.Node, classes: list[dict]) -> None:
+def _process_php_type(node: ts.Node, classes: list[dict], source: bytes) -> None:
     """Emit a class/interface/trait/enum entry from a type declaration node."""
     kind = _PHP_TYPE_NODES.get(node.type)
     if kind is None:
@@ -225,7 +527,17 @@ def _process_php_type(node: ts.Node, classes: list[dict]) -> None:
 
     base_classes: list[str] = []
     interfaces: list[str] = []
+    heritage: list[dict] = []
     methods: list[dict] = []
+
+    def _heritage_entry(ref_node: ts.Node, relation: str) -> dict:
+        return {
+            "name": _php_simple_name(ref_node),
+            "qualified": _node_text(ref_node),
+            "relation": relation,
+            "line": _line(ref_node),
+            "col": _utf16_col(ref_node, source),
+        }
 
     for c in node.children:
         if c.type == "base_clause":
@@ -233,45 +545,140 @@ def _process_php_type(node: ts.Node, classes: list[dict]) -> None:
             for bc in c.children:
                 if bc.type in _PHP_NAME_NODES:
                     base_classes.append(_php_simple_name(bc))
+                    heritage.append(_heritage_entry(bc, "extends"))
         elif c.type == "class_interface_clause":
             # `implements`
             for ic in c.children:
                 if ic.type in _PHP_NAME_NODES:
                     interfaces.append(_php_simple_name(ic))
+                    heritage.append(_heritage_entry(ic, "implements"))
 
+    # Properties/enum cases are collected apart from real methods: Phase 8
+    # keys method IDs by (file, class, name), so a property whose name matches
+    # a method would silently share the method's graph row.
+    pseudo_members: list[dict] = []
     body = node.child_by_field_name("body")
     if body is not None:
         for member in body.children:
             if member.type == "method_declaration":
-                m = _extract_php_function(member)
+                m = _extract_php_function(member, source, member_kind="method")
                 if m:
                     methods.append(m)
             elif member.type == "property_declaration":
-                methods.extend(_extract_php_properties(member))
+                pseudo_members.extend(_extract_php_properties(member, source))
             elif member.type == "use_declaration":
-                # Trait use — record like a mixin (matches Ruby `include`)
+                # Trait use — recorded alongside interfaces, as a mixin
                 for un in member.children:
                     if un.type in _PHP_NAME_NODES:
                         interfaces.append(_php_simple_name(un))
+                        heritage.append(_heritage_entry(un, "uses"))
             elif member.type == "enum_case":
                 cn = member.child_by_field_name("name")
                 if cn is not None:
-                    methods.append({
+                    pseudo_members.append({
                         "name": _node_text(cn), "modifiers": "case",
-                        "return_type": "", "parameters": "", "calls": [],
+                        "return_type": "", "parameters": "",
+                        "member_kind": "enum_case",
+                        "start_line": _line(member),
+                        "end_line": member.end_point[0] + 1,
+                        "param_types": {},
+                        "calls": [], "call_sites": [], "prop_sites": [],
+                        "class_refs": [], "assignments": [],
                     })
+
+    method_names = {m["name"] for m in methods}
+    seen_pseudo: set[str] = set()
+    for p in pseudo_members:
+        if p["name"] in method_names or p["name"] in seen_pseudo:
+            continue
+        seen_pseudo.add(p["name"])
+        methods.append(p)
 
     classes.append({
         "name": name,
         "kind": kind,
         "modifiers": _php_modifiers(node),
+        "fqcn": "",  # filled by _parse_php once the namespace is known
+        "start_line": _line(node),
+        "end_line": node.end_point[0] + 1,
         "base_classes": base_classes,
         "interfaces": list(dict.fromkeys(interfaces)),
+        "heritage": heritage,
         "methods": methods,
     })
 
 
-def _parse_php(tree: ts.Tree, file_path: str) -> dict[str, Any]:
+def _collect_uses(root: ts.Node, source: bytes) -> list[dict]:
+    """Structured `use` imports: FQCN + alias + kind + position.
+
+    Handles the group form `use Foo\\{Bar, Baz as Qux}` correctly (the legacy
+    `imports` list records group clauses without their `Foo\\` prefix).
+    """
+    uses: list[dict] = []
+
+    def _handle_clause(clause: ts.Node, prefix: str, kind: str):
+        target: ts.Node | None = None
+        alias = ""
+        for cc in clause.children:
+            # `use function Foo\bar;` puts the keyword inside the clause
+            if cc.type == "function":
+                kind = "function"
+            elif cc.type == "const":
+                kind = "const"
+            elif cc.type in _PHP_NAME_NODES or cc.type == "namespace_name":
+                if target is None:
+                    target = cc
+                else:
+                    # Group form: `use Foo\{Bar as Baz}` puts the alias as a
+                    # bare trailing `name` node (no aliasing-clause wrapper).
+                    alias = _node_text(cc)
+            elif cc.type == "namespace_aliasing_clause":
+                for an in cc.children:
+                    if an.type == "name":
+                        alias = _node_text(an)
+        if target is None:
+            return
+        fq = _node_text(target)
+        if prefix:
+            fq = f"{prefix}\\{fq}"
+        uses.append({
+            "fqcn": fq,
+            "alias": alias or fq.rsplit("\\", 1)[-1],
+            "kind": kind,
+            "line": _line(target),
+            "col": _utf16_col(target, source),
+        })
+
+    def _walk(n: ts.Node):
+        if n.type == "namespace_use_declaration":
+            kind = "class"
+            prefix = ""
+            group: ts.Node | None = None
+            for c in n.children:
+                if c.type == "function":
+                    kind = "function"
+                elif c.type == "const":
+                    kind = "const"
+                elif c.type == "namespace_name":
+                    prefix = _node_text(c)
+                elif c.type == "namespace_use_group":
+                    group = c
+            if group is not None:
+                for cl in group.children:
+                    if cl.type == "namespace_use_clause":
+                        _handle_clause(cl, prefix, kind)
+            else:
+                for cl in n.children:
+                    if cl.type == "namespace_use_clause":
+                        _handle_clause(cl, "", kind)
+        for child in n.children:
+            _walk(child)
+
+    _walk(root)
+    return uses
+
+
+def _parse_php(tree: ts.Tree, file_path: str, source: bytes) -> dict[str, Any]:
     """Parse a PHP file AST into the entity schema."""
     root = tree.root_node
     namespace = ""
@@ -281,14 +688,24 @@ def _parse_php(tree: ts.Tree, file_path: str) -> dict[str, Any]:
 
     # Imports: `use Foo\Bar;` clauses plus literal include/require targets.
     # Walks the whole tree so declarations inside braced namespaces are caught.
+    def _use_clauses(n: ts.Node) -> list[ts.Node]:
+        # Clauses sit directly under the declaration, or nested inside a
+        # namespace_use_group for the `use Foo\{Bar, Baz as Qux};` form.
+        found: list[ts.Node] = []
+        for c in n.children:
+            if c.type == "namespace_use_clause":
+                found.append(c)
+            else:
+                found.extend(_use_clauses(c))
+        return found
+
     def _walk_imports(node: ts.Node):
         if node.type == "namespace_use_declaration":
-            clauses = [c for c in node.children if c.type == "namespace_use_clause"]
+            clauses = _use_clauses(node)
             if clauses:
                 for c in clauses:
                     imports.append(_node_text(c))
             else:
-                # Group form `use Foo\{Bar, Baz};` — keep the raw declaration
                 imports.append(_node_text(node).removeprefix("use ").rstrip(";"))
         elif node.type in _PHP_INCLUDE_NODES:
             content = _php_find_string_content(node)
@@ -311,9 +728,9 @@ def _parse_php(tree: ts.Tree, file_path: str) -> dict[str, Any]:
                 if body is not None:  # rare braced form: namespace Foo { ... }
                     _walk_top(body.children)
             elif t in _PHP_TYPE_NODES:
-                _process_php_type(c, classes)
+                _process_php_type(c, classes, source)
             elif t == "function_definition":
-                m = _extract_php_function(c)
+                m = _extract_php_function(c, source, member_kind="function")
                 if m:
                     global_methods.append(m)
 
@@ -325,16 +742,27 @@ def _parse_php(tree: ts.Tree, file_path: str) -> dict[str, Any]:
             "name": "(global)",
             "kind": "module",
             "modifiers": "",
+            "fqcn": "",
+            "start_line": 1,
+            "end_line": root.end_point[0] + 1,
             "base_classes": [],
             "interfaces": [],
+            "heritage": [],
             "methods": global_methods,
         })
+
+    # FQCNs need the file-level namespace, which the walk discovers along the
+    # way — assign in a post-pass. The (global) pseudo-class keeps fqcn "".
+    for cls in classes:
+        if cls["name"] != "(global)":
+            cls["fqcn"] = f"{namespace}\\{cls['name']}" if namespace else cls["name"]
 
     return {
         "file_path": file_path,
         "namespace": namespace,
         "classes": classes,
         "imports": list(dict.fromkeys(imports)),
+        "uses": _collect_uses(root, source),
     }
 
 
@@ -342,7 +770,8 @@ def _php_find_string_content(node: ts.Node) -> str:
     """First literal string content under *node* (for include/require targets).
 
     Handles `'a.php'` (string), `"a.php"` (encapsed_string), and parenthesized
-    forms. Dynamic targets (variables, concatenation) return "".
+    forms. For concatenations (`__DIR__ . '/app.php'`) the first literal
+    fragment is returned; purely dynamic targets (variables) return "".
     """
     if node.type == "string_content":
         return _node_text(node)
@@ -446,14 +875,16 @@ def _collect_units(node: ts.Node, source: bytes, max_chars: int) -> list[str]:
                                     member_name = _node_source(mn, source)
                                     break
                             context = f"// class {class_name}, member {member_name} ({member_size:,} chars, split)"
+                            # Clamp: with a tiny budget the header allowance
+                            # would make the step <= 0 and loop forever.
+                            step = max(1, max_chars - 200)  # room for context header
                             pos = 0
                             part_idx = 0
                             while pos < member_size:
-                                end = pos + max_chars - 200  # room for context header
-                                chunk_text = member_src[pos:end]
+                                chunk_text = member_src[pos:pos + step]
                                 part_idx += 1
                                 units.append(f"{context} part {part_idx}\n{chunk_text}")
-                                pos = end
+                                pos += step
 
         else:
             # Other top-level nodes (php_tag, text, namespace statements,
@@ -467,14 +898,14 @@ def _collect_units(node: ts.Node, source: bytes, max_chars: int) -> list[str]:
             else:
                 # Oversized node — character-split with context
                 context = f"// {child.type} (line {child.start_point[0]+1}, {len(src):,} chars, split)"
+                step = max(1, max_chars - 200)  # clamped: see member split above
                 pos = 0
                 part_idx = 0
                 while pos < len(src):
-                    end = pos + max_chars - 200
-                    chunk_text = src[pos:end]
+                    chunk_text = src[pos:pos + step]
                     part_idx += 1
                     units.append(f"{context} part {part_idx}\n{chunk_text}")
-                    pos = end
+                    pos += step
 
         i += 1
 
@@ -547,7 +978,8 @@ def parse_entities(file_path: str, content: str) -> dict[str, Any] | None:
         content: Source code content as string
 
     Returns:
-        Entity dict matching the LLM extraction schema, or None if language unsupported.
+        Entity dict matching the LLM extraction schema (v2, see module
+        docstring), or None if language unsupported.
     """
     ext = os.path.splitext(file_path)[1].lower()
     lang = _EXT_TO_LANG.get(ext)
@@ -563,7 +995,8 @@ def parse_entities(file_path: str, content: str) -> dict[str, Any] | None:
         return None
 
     try:
-        tree = parser.parse(content.encode("utf-8", errors="replace"))
-        return parse_fn(tree, file_path)
+        source = content.encode("utf-8", errors="replace")
+        tree = parser.parse(source)
+        return parse_fn(tree, file_path, source)
     except Exception:
         return None

@@ -34,6 +34,8 @@ def _print_timing_report(data, total_elapsed: float):
     phase_order = [
         ("phase1_scan", "Phase 1: File Scanning"),
         ("phase1b_treesitter", "Phase 1.5: Tree-sitter Entities"),
+        ("phase1c_lsp_resolution", "Phase 1.6: LSP Resolution"),
+        ("phase1d_db_schema", "Phase 1.7: DB Schema (migrations)"),
         ("phase2_file_summaries", "Phase 2: File Summaries"),
         ("phase3_dir_summaries", "Phase 3: Dir Summaries"),
         ("phase4_topics", "Phase 4: Topic Extraction"),
@@ -113,7 +115,18 @@ def _load_pipeline_data(target_dir: str) -> PipelineData | None:
     path = _pipeline_data_path()
     if os.path.exists(path):
         with open(path, "rb") as f:
-            return pickle.load(f)
+            data = pickle.load(f)
+        # Pickle restores __dict__ only — a pkl written by an older version
+        # lacks fields added since (resolutions, file_origins, ...). Backfill
+        # dataclass defaults so attribute access doesn't AttributeError.
+        import dataclasses
+        for f in dataclasses.fields(PipelineData):
+            if not hasattr(data, f.name):
+                if f.default is not dataclasses.MISSING:
+                    setattr(data, f.name, f.default)
+                elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+                    setattr(data, f.name, f.default_factory())
+        return data
     return None
 
 
@@ -179,6 +192,41 @@ def _print_banner(label: str, target_dir: str):
     print("=" * 70)
 
 
+def _resolve_include_vendor(target_dir, args) -> bool:
+    """Decide whether vendor/ files join the graph.
+
+    Precedence: --include-vendor / --exclude-vendor flags → INCLUDE_VENDOR env
+    → interactive prompt (only when vendor files exist and stdin is a TTY) →
+    default exclude. The prompt reports vendor file count + total size first.
+    """
+    from .pipeline import vendor_stats
+
+    if getattr(args, "include_vendor", False):
+        return True
+    if getattr(args, "exclude_vendor", False):
+        return False
+    env = config.INCLUDE_VENDOR.strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+
+    stats = vendor_stats(target_dir)
+    if stats["files"] == 0:
+        return False
+    mb = stats["bytes"] / (1024 * 1024)
+    print(f"\n  Found {stats['files']} vendor PHP files ({mb:.1f} MB) under this target.")
+    print("  Including them adds graph nodes/edges marked origin='vendor'")
+    print("  (calls into vendor still resolve); they are excluded from the")
+    print("  generated docs and embeddings to control cost.")
+    if not sys.stdin.isatty():
+        print("  Non-interactive session -> excluding vendor "
+              "(pass --include-vendor to include).")
+        return False
+    answer = input("  Include vendor files in the graph? [y/N]: ").strip().lower()
+    return answer in ("y", "yes")
+
+
 def cmd_docs(args):
     """Run docs generation pipeline only (Phases 1-6)."""
     _check_config()
@@ -187,9 +235,10 @@ def cmd_docs(args):
         print(f"Error: Directory not found: {target_dir}")
         sys.exit(1)
 
+    include_vendor = _resolve_include_vendor(target_dir, args)
     _print_banner("Docs Generation (Phases 1-6)", target_dir)
     total_start = time.time()
-    data = asyncio.run(run_docs_pipeline(target_dir))
+    data = asyncio.run(run_docs_pipeline(target_dir, include_vendor=include_vendor))
     total_elapsed = time.time() - total_start
     _print_timing_report(data, total_elapsed)
 
@@ -228,6 +277,7 @@ def cmd_graph(args):
     else:
         print("  No saved pipeline data — running scan + tree-sitter...")
         data = PipelineData(target_dir=os.path.abspath(target_dir))
+        data.include_vendor = _resolve_include_vendor(target_dir, args)
         phase1_scan(data)
         phase1b_treesitter_entities(data)
         _load_summaries_from_disk(data)
@@ -245,9 +295,10 @@ def cmd_run(args):
         print(f"Error: Directory not found: {target_dir}")
         sys.exit(1)
 
+    include_vendor = _resolve_include_vendor(target_dir, args)
     _print_banner("Full Pipeline (Phases 1-10)", target_dir)
     total_start = time.time()
-    data = asyncio.run(run_pipeline(target_dir))
+    data = asyncio.run(run_pipeline(target_dir, include_vendor=include_vendor))
     total_elapsed = time.time() - total_start
     _print_timing_report(data, total_elapsed)
 
@@ -269,8 +320,7 @@ def cmd_analyze(args):
 def cmd_setup_spanner(args):
     """Create Spanner instance, database, tables, and property graph."""
     _check_config()
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from setup_spanner_graph import create_instance, create_database, verify
+    from .setup_spanner_graph import create_instance, create_database, verify
 
     project = config.GCP_PROJECT
     instance = getattr(args, "instance", None) or config.SPANNER_INSTANCE
@@ -300,6 +350,18 @@ def cmd_setup_spanner(args):
     print("\nSpanner setup complete.")
 
 
+def cmd_evaluate(args):
+    """Evaluate the extractor + resolver against the committed fixtures."""
+    from .evaluate import run_evaluation
+
+    fixtures = (["php_plain", "php_cakephp"] if args.fixture == "all"
+                else [args.fixture])
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = run_evaluation(fixtures, repo_root,
+                          dump_edges=getattr(args, "dump_edges", False))
+    sys.exit(code)
+
+
 def cmd_validate(args):
     """Validate Spanner graph data against expected counts."""
     db = _get_spanner_db()
@@ -307,10 +369,8 @@ def cmd_validate(args):
     print("  GRAPH VALIDATION")
     print("=" * 70)
 
-    tables = ["Files", "Classes", "Methods", "Modules", "Directories",
-              "FileDependsOn", "ClassInherits", "MethodCalls",
-              "FileDefinesClass", "ClassDefinesMethod",
-              "FileBelongsToModule", "DirContainsFile"]
+    from .setup_spanner_graph import NODE_TABLES, EDGE_TABLES
+    tables = NODE_TABLES + EDGE_TABLES
 
     for table in tables:
         with db.snapshot() as snap:
@@ -318,7 +378,9 @@ def cmd_validate(args):
             count = rows[0][0] if rows else 0
             print(f"  {table:<25} {count:>10,}")
 
-    # Check for orphaned edges
+    # Check for orphaned edges (both endpoints must resolve to a node). The
+    # resolution-driven Phase 9 should make MethodCalls/PossiblyCalls/
+    # TableReferences orphan-free too — surface any that aren't.
     print("\n  Orphan checks:")
     orphan_queries = [
         ("FileDependsOn → Files", """
@@ -330,6 +392,31 @@ def cmd_validate(args):
             SELECT COUNT(*) FROM ClassInherits e
             WHERE NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.child_class)
                OR NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.parent_class)
+        """),
+        ("MethodCalls → Methods", """
+            SELECT COUNT(*) FROM MethodCalls e
+            WHERE NOT EXISTS (SELECT 1 FROM Methods m WHERE m.method_id = e.caller_method)
+               OR NOT EXISTS (SELECT 1 FROM Methods m WHERE m.method_id = e.callee_method)
+        """),
+        ("PossiblyCalls → Methods", """
+            SELECT COUNT(*) FROM PossiblyCalls e
+            WHERE NOT EXISTS (SELECT 1 FROM Methods m WHERE m.method_id = e.caller_method)
+               OR NOT EXISTS (SELECT 1 FROM Methods m WHERE m.method_id = e.callee_method)
+        """),
+        ("FileImports → Files", """
+            SELECT COUNT(*) FROM FileImports e
+            WHERE NOT EXISTS (SELECT 1 FROM Files f WHERE f.file_id = e.source_file)
+               OR NOT EXISTS (SELECT 1 FROM Files f WHERE f.file_id = e.target)
+        """),
+        ("TableReferences → DbTables", """
+            SELECT COUNT(*) FROM TableReferences e
+            WHERE NOT EXISTS (SELECT 1 FROM DbTables t WHERE t.table_id = e.source_table)
+               OR NOT EXISTS (SELECT 1 FROM DbTables t WHERE t.table_id = e.target_table)
+        """),
+        ("ClassMapsToTable → nodes", """
+            SELECT COUNT(*) FROM ClassMapsToTable e
+            WHERE NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.class_id)
+               OR NOT EXISTS (SELECT 1 FROM DbTables t WHERE t.table_id = e.table_id)
         """),
     ]
     for label, query in orphan_queries:
@@ -349,6 +436,12 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    def _add_vendor_flags(p):
+        p.add_argument("--include-vendor", action="store_true",
+                       help="Include vendor/ files in the graph (skip the prompt)")
+        p.add_argument("--exclude-vendor", action="store_true",
+                       help="Exclude vendor/ files (skip the prompt)")
+
     # init
     p_init = subparsers.add_parser("init", help="Setup: generate .env configuration")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing .env")
@@ -356,14 +449,17 @@ def main():
     # analyze — full pipeline
     p = subparsers.add_parser("analyze", help="Run full pipeline: docs + graph (Phases 1-10)")
     p.add_argument("target_dir", help="Source code directory")
+    _add_vendor_flags(p)
 
     # generate — subcommands
     p_gen = subparsers.add_parser("generate", help="Generate docs or graph")
     gen_sub = p_gen.add_subparsers(dest="gen_command")
     p_gw = gen_sub.add_parser("wiki", help="Generate documentation (Phases 1-6)")
     p_gw.add_argument("target_dir", help="Source code directory")
+    _add_vendor_flags(p_gw)
     p_gg = gen_sub.add_parser("graph", help="Generate Spanner graph (Phases 8-10)")
     p_gg.add_argument("target_dir", help="Source code directory")
+    _add_vendor_flags(p_gg)
 
     # upload — subcommands
     p_up = subparsers.add_parser("upload", help="Upload graph data to Spanner")
@@ -382,6 +478,16 @@ def main():
 
     # validate
     subparsers.add_parser("validate", help="Validate Spanner graph data")
+
+    # --- evaluate (local, no GCP) ---
+    p_eval = subparsers.add_parser(
+        "evaluate", help="Evaluate extractor+resolver against test_codes/ fixtures (local, no GCP)")
+    p_eval.add_argument("--fixture", choices=["php_plain", "php_cakephp", "all"],
+                        default="all", help="Fixture to evaluate (default: all)")
+    p_eval.add_argument("--dump-edges", action="store_true",
+                        help="Include derived MethodCalls/PossiblyCalls/ClassInherits in the report dict")
+    p_eval.add_argument("--quiet-misses", action="store_true",
+                        help="Hide per-case miss details")
 
     args = parser.parse_args()
 
@@ -409,6 +515,8 @@ def main():
             cmd_upload_graph(args)
         else:
             p_up.print_help()
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
     elif args.command == "validate":
         cmd_validate(args)
 

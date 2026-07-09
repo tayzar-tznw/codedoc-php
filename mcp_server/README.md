@@ -33,15 +33,15 @@ The repo ships a setup script that creates it:
 
 ```bash
 # Spanner Graph
-#   WARNING: hardcoded to 1000 PU Enterprise tier (~$13/hr idle).
-#   Edit setup_spanner_graph.py line 189 if you want fewer PU (100 PU min).
-python setup_spanner_graph.py --project code-doc-graph
+#   NOTE: creates a 100 PU Enterprise-tier instance (billed while it exists).
+#   Edit `processing_units` in graph_generator/setup_spanner_graph.py to change.
+python -m graph_generator.setup_spanner_graph --project code-doc-graph
 
 # Tear down Spanner when done:
-python setup_spanner_graph.py --destroy --project code-doc-graph
+python -m graph_generator.setup_spanner_graph --destroy --project code-doc-graph
 ```
 
-`setup_spanner_graph.py` creates instance `codedoc-instance` / db `codedoc-db` by default, but the agent and `deploy.sh` default to `java-codegraph` / `java-codegraph-db` (the names that match the current `.env` and live infra). If you want the agent to talk to a freshly provisioned instance, pass `--instance java-codegraph --database java-codegraph-db` to the setup script, OR override `SPANNER_INSTANCE` / `SPANNER_DATABASE` env vars on the agent side.
+`graph_generator/setup_spanner_graph.py` creates instance `codedoc-instance` / db `codedoc-db` by default, but the agent and `deploy.sh` default to `java-codegraph` / `java-codegraph-db` (the names that match the current `.env` and live infra). If you want the agent to talk to a freshly provisioned instance, pass `--instance java-codegraph --database java-codegraph-db` to the setup script, OR override `SPANNER_INSTANCE` / `SPANNER_DATABASE` env vars on the agent side.
 
 ---
 
@@ -215,7 +215,7 @@ gcloud iam service-accounts delete codedoc-mcp-sa@code-doc-graph.iam.gserviceacc
 | Symptom | Likely cause |
 |---|---|
 | `ImportError: graph_query_agent` when running locally | You launched from a directory other than the repo root. `python -m mcp_server` expects the repo root on `sys.path`. |
-| `ask_codebase` returns `NOT_FOUND: Instance not found` | Spanner instance referenced by `SPANNER_INSTANCE` doesn't exist. Run `python setup_spanner_graph.py --project ${GOOGLE_CLOUD_PROJECT} --instance ${SPANNER_INSTANCE} --database ${SPANNER_DATABASE}`. |
+| `ask_codebase` returns `NOT_FOUND: Instance not found` | Spanner instance referenced by `SPANNER_INSTANCE` doesn't exist. Run `python -m graph_generator.setup_spanner_graph --project ${GOOGLE_CLOUD_PROJECT} --instance ${SPANNER_INSTANCE} --database ${SPANNER_DATABASE}`. |
 | `403 Forbidden` from the proxy | Your principal lacks `roles/run.invoker` on the service. Re-run the `add-iam-policy-binding` command above. |
 | `PermissionDenied` from Spanner in the Cloud Run logs | Service-account role binding hasn't propagated yet (can take 60–90 s) or the wrong project was used. Check `gcloud projects get-iam-policy ${PROJECT_ID} --flatten='bindings[].members' --filter='bindings.members:codedoc-mcp-sa@'`. |
 | agy doesn't see the codedoc tools | Extension is missing or in the wrong place. Confirm `ls ~/.gemini/extensions/codedoc/gemini-extension.json` exists and the JSON parses. Restart `agy`. |

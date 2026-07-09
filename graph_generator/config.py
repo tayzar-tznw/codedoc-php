@@ -41,6 +41,23 @@ EMBED_CONCURRENCY = _env_int("EMBED_CONCURRENCY", 20)
 # ── Output ────────────────────────────────────────────────────
 OUTPUT_DIR = _env("OUTPUT_DIR", "output_docs_pipeline")
 
+# ── LSP resolution (Phase 1.6) ────────────────────────────────
+# Intelephense binary; install with `npm i -g intelephense`. When missing,
+# Phase 1.6 degrades to convention/parser resolution with a loud warning
+# (calls it cannot confirm go to PossiblyCalls, never to MethodCalls).
+INTELEPHENSE_PATH = _env("INTELEPHENSE_PATH", "intelephense")
+LSP_INDEX_TIMEOUT = _env_int("LSP_INDEX_TIMEOUT", 300)      # seconds
+LSP_REQUEST_TIMEOUT = _env_int("LSP_REQUEST_TIMEOUT", 15)   # seconds
+
+# Unresolved/ambiguous calls become PossiblyCalls edges toward same-named
+# internal methods — but only when the candidate count stays at or below
+# this cap (common names like `get` would otherwise fan out absurdly).
+POSSIBLY_CALLS_MAX_CANDIDATES = _env_int("POSSIBLY_CALLS_MAX_CANDIDATES", 5)
+
+# Vendor scanning: "" → interactive prompt when vendor dirs are found
+# (non-TTY defaults to exclude); "true"/"false" → no prompt.
+INCLUDE_VENDOR = _env("INCLUDE_VENDOR", "")
+
 # ── File scanning ─────────────────────────────────────────────
 # PHP only. `.ctp` covers legacy CakePHP (≤3) view templates — plain PHP syntax.
 SOURCE_EXTENSIONS = {

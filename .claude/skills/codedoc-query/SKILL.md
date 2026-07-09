@@ -83,9 +83,19 @@ survive a server restart.
 The agent translates questions into GQL over these entities (the same schema for
 every CodeDoc-indexed codebase):
 
-- **Nodes**: `Files`, `Classes`, `Methods`, `Modules`, `Directories` (each with a `summary`).
-- **Edges**: `FileDependsOn`, `ClassInherits`, `MethodCalls`, `FileDefinesClass`,
-  `ClassDefinesMethod`, `FileBelongsToModule`, `DirContainsFile`.
+- **Nodes** (6): `Files`, `Classes`, `Methods`, `Modules`, `Directories`,
+  `DbTables` (each with a `summary`; `DbTables` is the DB schema replayed from
+  migration files — columns, indexes, foreign keys).
+- **Edges** (11): `FileImports`, `FileDependsOn`, `ClassInherits`, `MethodCalls`,
+  `PossiblyCalls`, `FileDefinesClass`, `ClassDefinesMethod`,
+  `FileBelongsToModule`, `DirContainsFile`, `TableReferences`, `ClassMapsToTable`.
+
+Call/inheritance/import edges (`MethodCalls`, `ClassInherits`, `FileImports`,
+`FileDependsOn`) contain only **resolved** targets and carry a `resolution`
+provenance property; unconfirmed candidate calls live in `PossiblyCalls` instead
+— treat those as "maybe". `TableReferences` is a table→table foreign key;
+`ClassMapsToTable` links a CakePHP Table class to its `DbTables` row.
+`Files`/`Classes`/`Methods` also carry an `origin` property (`app` | `vendor`).
 
 ## Asking good questions
 
@@ -98,6 +108,7 @@ every CodeDoc-indexed codebase):
   - "which files depend on `<path/to/File>`?"
   - "show the inheritance hierarchy under `<BaseClass>`"
   - "are there any cyclic dependencies?"
+  - "which DB table does `<TableClass>` map to?" / "which tables reference `<table_name>`?"
   - "give a high-level overview of this codebase" / "what does the `<module>` module do?"
 - **Japanese phrasing works best**, English is accepted (e.g. `<ClassName> のメソッドを一覧して`).
 

@@ -1,0 +1,178 @@
+{
+  "version": 1,
+  "fixture": "php_plain",
+  "language": "ja",
+  "questions": [
+    {
+      "id": "QA-01",
+      "question": "App\\S08_Magic\\EngineProxy のマジックメソッド __call は、グラフ上に Methods ノードとして存在しますか？",
+      "check": {"type": "node_exists", "subject": "App\\S08_Magic\\EngineProxy::__call"},
+      "expected": ["exists"],
+      "match": "equals"
+    },
+    {
+      "id": "QA-02",
+      "question": "トレイト App\\S06_Traits\\GreetsFormally はどのファイルで定義されていますか？",
+      "check": {"type": "class_file", "subject": "App\\S06_Traits\\GreetsFormally"},
+      "expected": ["src/S06_Traits/GreetsFormally.php"],
+      "match": "equals"
+    },
+    {
+      "id": "QA-03",
+      "question": "クラス App\\S08_Magic\\EngineProxy が定義しているメソッドをすべて列挙してください（マジックメソッドを含む）。",
+      "check": {"type": "methods_of", "subject": "App\\S08_Magic\\EngineProxy"},
+      "expected": ["__call", "__construct", "__get", "stop"],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-04",
+      "question": "App\\S02_TypedReceivers\\Dispatcher::dispatchInvoice が呼び出す内部メソッドはどれですか？同名の send() を持つ Newsletter ではなく、型付きレシーバから Invoice::send に解決されている必要があります。",
+      "check": {"type": "callees_of", "subject": "App\\S02_TypedReceivers\\Dispatcher::dispatchInvoice"},
+      "expected": ["App\\S02_TypedReceivers\\Invoice::send"],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-05",
+      "question": "App\\S02_TypedReceivers\\Invoice::send を呼び出しているメソッドをすべて挙げてください。同名メソッド Newsletter::send の呼び出し元（dispatchNewsletter）が混入していないことを確認します。",
+      "check": {"type": "callers_of", "subject": "App\\S02_TypedReceivers\\Invoice::send"},
+      "expected": [
+        "App\\S02_TypedReceivers\\Dispatcher::dispatchInvoice",
+        "App\\S02_TypedReceivers\\Dispatcher::dispatchAnnotated"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-06",
+      "question": "App\\S03_VendorTwins\\DualReportRunner::runBoth から内部ノードへの MethodCalls エッジはありますか？Acme\\Reporting\\Report と Globex\\Reporting\\Report という vendor 双子クラスの generate() 呼び出しは external として集計され、エッジは 1 本も生成されないはずです。",
+      "check": {"type": "callees_of", "subject": "App\\S03_VendorTwins\\DualReportRunner::runBoth"},
+      "expected": [],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-07",
+      "question": "src/S03_VendorTwins/DualReportRunner.php から張られている FileImports エッジを列挙してください。use 文の対象が両方とも vendor パッケージ（external）のため、内部ファイルへの FileImports エッジは存在しないはずです。",
+      "check": {"type": "imports_of", "subject": "src/S03_VendorTwins/DualReportRunner.php"},
+      "expected": [],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-08",
+      "question": "クラス App\\S04_Inheritance\\ChildWidget の直接の親クラスは何ですか？",
+      "check": {"type": "parents_of", "subject": "App\\S04_Inheritance\\ChildWidget"},
+      "expected": ["App\\S04_Inheritance\\ParentWidget"],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-09",
+      "question": "App\\S04_Inheritance\\WidgetConsumer::inspect が呼び出すメソッドを列挙してください。inheritedOnly() は継承チェーンを遡って GrandparentWidget の定義に、format() は ParentWidget の定義に解決されるはずです。",
+      "check": {"type": "callees_of", "subject": "App\\S04_Inheritance\\WidgetConsumer::inspect"},
+      "expected": [
+        "App\\S04_Inheritance\\ChildWidget::describe",
+        "App\\S04_Inheritance\\ParentWidget::format",
+        "App\\S04_Inheritance\\GrandparentWidget::inheritedOnly"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-10",
+      "question": "インターフェース App\\S05_InterfaceDispatch\\PaymentGateway を実装しているクラスをすべて挙げてください。",
+      "check": {"type": "children_of", "subject": "App\\S05_InterfaceDispatch\\PaymentGateway"},
+      "expected": [
+        "App\\S05_InterfaceDispatch\\StripeGateway",
+        "App\\S05_InterfaceDispatch\\BraintreeGateway"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-11",
+      "question": "App\\S05_InterfaceDispatch\\PaymentGateway::authorize の呼び出し元はどのメソッドですか？インターフェース型のレシーバを介した呼び出しがインターフェース側の宣言に解決されているはずです。",
+      "check": {"type": "callers_of", "subject": "App\\S05_InterfaceDispatch\\PaymentGateway::authorize"},
+      "expected": [
+        "App\\S05_InterfaceDispatch\\Checkout::pay",
+        "App\\S05_InterfaceDispatch\\Checkout::payVia"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-12",
+      "question": "クラス App\\S06_Traits\\Greeter が use しているトレイトをすべて挙げてください。insteadof で衝突を解決しつつ、両方のトレイトを取り込んでいます。",
+      "check": {"type": "parents_of", "subject": "App\\S06_Traits\\Greeter"},
+      "expected": [
+        "App\\S06_Traits\\GreetsFormally",
+        "App\\S06_Traits\\GreetsCasually"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-13",
+      "question": "App\\S08_Magic\\MagicConsumer::exercise が呼び出すメソッドを列挙してください。EngineProxy の __call/__get を経由する呼び出しは convention:magic_proxy により実体クラス Engine のメソッドへ解決され、stop() のような実在メソッドは EngineProxy 自身に解決されるはずです。",
+      "check": {"type": "callees_of", "subject": "App\\S08_Magic\\MagicConsumer::exercise"},
+      "expected": [
+        "App\\S08_Magic\\Engine::start",
+        "App\\S08_Magic\\Engine::getTemperature",
+        "App\\S08_Magic\\Engine::status",
+        "App\\S08_Magic\\EngineProxy::__construct",
+        "App\\S08_Magic\\EngineProxy::stop"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-14",
+      "question": "App\\S14_ConditionalTypes\\ConditionalConsumer::export の write() 呼び出しは union 型レシーバのため一意に解決できません。PossiblyCalls に登録された候補（ambiguous）をすべて挙げてください。",
+      "check": {"type": "possibly_callees_of", "subject": "App\\S14_ConditionalTypes\\ConditionalConsumer::export"},
+      "expected": [
+        "App\\S14_ConditionalTypes\\CsvWriter::write",
+        "App\\S14_ConditionalTypes\\JsonWriter::write"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-15",
+      "question": "遅延静的束縛 static::name() を含む App\\S07_LateStaticBinding\\ModelBase::whoAmI の PossiblyCalls 候補に、App\\S07_LateStaticBinding\\ModelBase::name が含まれていますか？",
+      "check": {"type": "possibly_callees_of", "subject": "App\\S07_LateStaticBinding\\ModelBase::whoAmI"},
+      "expected": ["App\\S07_LateStaticBinding\\ModelBase::name"],
+      "match": "contains_all"
+    },
+    {
+      "id": "QA-16",
+      "question": "App\\S16_StaticVsInstance\\TimeConsumer::tick が呼び出す now() はどの定義に解決されますか？静的呼び出し（Clock::now）とインスタンス呼び出し（Calendar の now）が同名でも別々のメソッドとして記録されるはずです。",
+      "check": {"type": "callees_of", "subject": "App\\S16_StaticVsInstance\\TimeConsumer::tick"},
+      "expected": [
+        "App\\S16_StaticVsInstance\\Clock::now",
+        "App\\S16_StaticVsInstance\\Calendar::now"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-17",
+      "question": "グローバル関数 format_label の呼び出し元をすべて挙げてください。名前空間内に同名関数を持たないコンテキストからの呼び出しだけが、グローバル定義へフォールバックするはずです。",
+      "check": {"type": "callers_of", "subject": "format_label"},
+      "expected": [
+        "App\\S13_Functions\\FunctionConsumer::globalOnly",
+        "App\\S13_Functions\\Sub\\OtherNsConsumer::resolve"
+      ],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-18",
+      "question": "App\\S13_Functions\\FunctionConsumer::local 内の format_label() 呼び出しはどの定義に解決されますか？同一名前空間の関数 App\\S13_Functions\\format_label がグローバル定義より優先されるはずです。",
+      "check": {"type": "callees_of", "subject": "App\\S13_Functions\\FunctionConsumer::local"},
+      "expected": ["App\\S13_Functions\\format_label"],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-19",
+      "question": "App\\S15_DynamicNames\\DynamicConsumer::dispatch のような動的メソッド名（$this->$method() 形式）の呼び出しから MethodCalls エッジは生成されますか？dynamic 判定のため、確定エッジは 0 件のはずです。",
+      "check": {"type": "callees_of", "subject": "App\\S15_DynamicNames\\DynamicConsumer::dispatch"},
+      "expected": [],
+      "match": "exact_set"
+    },
+    {
+      "id": "QA-20",
+      "question": "このフィクスチャ全体で ClassInherits エッジ（extends / implements / トレイト use）は少なくとも 9 件登録されていますか？",
+      "check": {"type": "count_at_least", "subject": "ClassInherits", "table": "ClassInherits", "min": 9},
+      "expected": 9,
+      "match": "count_at_least"
+    }
+  ]
+}

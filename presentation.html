@@ -707,7 +707,7 @@
       <div class="card" style="border-top:3px solid var(--accent-purple);">
         <span class="badge badge-purple mb-8">レイヤー 2</span>
         <h3 style="font-size:18px;">構造的理解</h3>
-        <p style="font-size:14px;color:var(--text-secondary);line-height:1.7;">Geminiがソースコードを分析し、エンティティ（クラス、メソッド、import、継承関係）を抽出。Spanner Graphが関係性をグラフとして保存。</p>
+        <p style="font-size:14px;color:var(--text-secondary);line-height:1.7;">Tree-sitterがソースコードをAST解析し、エンティティ（クラス、メソッド、use、継承関係）を抽出。Spanner Graphが関係性をグラフとして保存。</p>
       </div>
       <div class="card" style="border-top:3px solid var(--accent-green);">
         <span class="badge badge-green mb-8">レイヤー 3</span>
@@ -1059,44 +1059,44 @@ graph TB
       <div class="gql-example">
         <div class="label">このファイルに依存しているものは？</div>
         <div class="code-block" style="font-size:13px;padding:10px 14px;">
-<span class="keyword">GRAPH</span> CodeGraph<br>
-<span class="keyword">MATCH</span> (dep)-[<span class="type">:DEPENDS_ON</span>]->(f)<br>
-<span class="keyword">WHERE</span> f.name = <span class="string">'PaymentsService'</span><br>
-<span class="keyword">RETURN</span> dep.name, dep.file_path
+<span class="keyword">GRAPH</span> code_graph_a<br>
+<span class="keyword">MATCH</span> (dep:Files)-[<span class="type">:FileDependsOn</span>]->(f:Files)<br>
+<span class="keyword">WHERE</span> f.file_name = <span class="string">'PaymentsService.php'</span><br>
+<span class="keyword">RETURN</span> dep.file_name
         </div>
       </div>
       <div class="gql-example">
-        <div class="label">BaseEntityを継承しているクラスは？</div>
+        <div class="label">AppControllerを継承しているクラスは？</div>
         <div class="code-block" style="font-size:13px;padding:10px 14px;">
-<span class="keyword">GRAPH</span> CodeGraph<br>
-<span class="keyword">MATCH</span> (c)-[<span class="type">:INHERITS</span>]->(p)<br>
-<span class="keyword">WHERE</span> p.name = <span class="string">'BaseEntity'</span><br>
-<span class="keyword">RETURN</span> c.name, c.type
+<span class="keyword">GRAPH</span> code_graph_a<br>
+<span class="keyword">MATCH</span> (c:Classes)-[<span class="type">:ClassInherits</span>]->{1,5}(p:Classes)<br>
+<span class="keyword">WHERE</span> p.name = <span class="string">'AppController'</span><br>
+<span class="keyword">RETURN</span> c.name, c.kind
         </div>
       </div>
       <div class="gql-example">
-        <div class="label">影響分析：OwnerController変更時</div>
+        <div class="label">影響分析：UsersController変更時</div>
         <div class="code-block" style="font-size:13px;padding:10px 14px;">
-<span class="keyword">GRAPH</span> CodeGraph<br>
-<span class="keyword">MATCH</span> (a)-[<span class="type">:DEPENDS_ON</span>*1..3]->(f)<br>
-<span class="keyword">WHERE</span> f.name = <span class="string">'OwnerController'</span><br>
-<span class="keyword">RETURN</span> a.name <span class="comment">-- 影響を受けるノード</span>
+<span class="keyword">GRAPH</span> code_graph_a<br>
+<span class="keyword">MATCH</span> (a:Files)-[<span class="type">:FileDependsOn</span>]->{1,3}(f:Files)<br>
+<span class="keyword">WHERE</span> f.file_name = <span class="string">'UsersController.php'</span><br>
+<span class="keyword">RETURN</span> a.file_name <span class="comment">-- 影響を受けるノード</span>
         </div>
       </div>
       <div class="gql-example">
         <div class="label">循環依存の検出</div>
         <div class="code-block" style="font-size:13px;padding:10px 14px;">
-<span class="keyword">GRAPH</span> CodeGraph<br>
-<span class="keyword">MATCH</span> (a)-[<span class="type">:DEPENDS_ON</span>*2..10]->(a)<br>
-<span class="keyword">RETURN</span> a.name <span class="comment">-- 循環参照</span>
+<span class="keyword">GRAPH</span> code_graph_a<br>
+<span class="keyword">MATCH</span> (a:Files)-[<span class="type">:FileDependsOn</span>]->{2,10}(a)<br>
+<span class="keyword">RETURN DISTINCT</span> a.file_name <span class="comment">-- 循環参照</span>
         </div>
       </div>
       <div class="gql-example">
         <div class="label">未使用クラスの検出</div>
         <div class="code-block" style="font-size:13px;padding:10px 14px;">
-<span class="keyword">GRAPH</span> CodeGraph<br>
-<span class="keyword">MATCH</span> (c)<br>
-<span class="keyword">WHERE</span> c.type = <span class="string">'class'</span><br>
+<span class="keyword">GRAPH</span> code_graph_a<br>
+<span class="keyword">MATCH</span> (c:Classes)<br>
+<span class="keyword">WHERE</span> c.kind = <span class="string">'class'</span><br>
   <span class="keyword">AND NOT EXISTS</span> { <span class="keyword">MATCH</span> ()-[]->(c) }<br>
 <span class="keyword">RETURN</span> c.name <span class="comment">-- 孤立クラス</span>
         </div>
@@ -1104,8 +1104,8 @@ graph TB
       <div class="gql-example">
         <div class="label">メソッド呼び出しチェーン分析</div>
         <div class="code-block" style="font-size:13px;padding:10px 14px;">
-<span class="keyword">GRAPH</span> CodeGraph<br>
-<span class="keyword">MATCH</span> (m1)-[<span class="type">:CALLS</span>]->(m2)-[<span class="type">:CALLS</span>]->(m3)<br>
+<span class="keyword">GRAPH</span> code_graph_a<br>
+<span class="keyword">MATCH</span> (m1:Methods)-[<span class="type">:MethodCalls</span>]->(m2:Methods)-[<span class="type">:MethodCalls</span>]->(m3:Methods)<br>
 <span class="keyword">WHERE</span> m1.name = <span class="string">'processPayment'</span><br>
 <span class="keyword">RETURN</span> m1.name, m2.name, m3.name
         </div>

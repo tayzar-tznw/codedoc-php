@@ -58,8 +58,19 @@ class PipelineData:
     # Phase 5
     topic_summaries: dict[str, str] = field(default_factory=dict)
 
-    # Phase 7
+    # Phase 1.5 (field predates the phase renumbering)
     extracted_entities: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 1.6 semantic resolution ({"engine": ..., "files": {rel: record}})
+    resolutions: dict[str, Any] = field(default_factory=dict)
+
+    # Vendor handling (Phase 1 scan): rel_path → 'app' | 'vendor'
+    file_origins: dict[str, str] = field(default_factory=dict)
+    include_vendor: bool = False
+
+    # Phase 1.7 DB schema (from Phinx migrations): {"tables": {...}, "warnings": [...]}
+    db_schema: dict[str, Any] = field(default_factory=dict)
+    dbtable_id_map: dict[str, str] = field(default_factory=dict)
 
     # Phase 8-10 (graph ID maps)
     file_id_map: dict[str, str] = field(default_factory=dict)
@@ -108,6 +119,11 @@ def _log_error(msg: str):
 
 
 _CHUNK_CHARS = 800_000  # ~200K tokens normal code, ~267K for data-dense — safe under 1M
+
+# Node/edge ID scheme version. Bump when _make_id inputs change shape (e.g. the
+# switch to target-relative paths + FQCN keys) so resumed graph checkpoints from
+# an older scheme are discarded instead of mixing incompatible IDs.
+ID_SCHEME = 2
 
 
 def _read_source_file(file_path: str) -> str:
@@ -501,9 +517,17 @@ def _load_checkpoint(data: PipelineData):
     entities_path = os.path.join(out_root, "entities.json")
     if os.path.isfile(entities_path):
         try:
+            from .treesitter_parser import ENTITIES_VERSION
             with open(entities_path, "r", encoding="utf-8") as f:
-                data.extracted_entities = json.load(f)
-            resumed["entities"] = len(data.extracted_entities)
+                payload = json.load(f)
+            # v2+ checkpoints are {"version": N, "entities": {...}}; anything
+            # else (incl. the old bare-dict format) lacks resolution inputs —
+            # discard so Phase 1.5 re-parses.
+            if isinstance(payload, dict) and payload.get("version") == ENTITIES_VERSION:
+                data.extracted_entities = payload.get("entities", {})
+                resumed["entities"] = len(data.extracted_entities)
+            else:
+                _print("  [Resume] entities.json has an old schema — re-parsing in Phase 1.5")
         except Exception:
             pass
 
@@ -515,11 +539,14 @@ def _load_checkpoint(data: PipelineData):
 
 def _save_entities(data: PipelineData):
     """Save extracted entities to disk for resume support."""
+    from .treesitter_parser import ENTITIES_VERSION
+
     out_root = os.path.join(os.getcwd(), config.OUTPUT_DIR)
     os.makedirs(out_root, exist_ok=True)
     entities_path = os.path.join(out_root, "entities.json")
     with open(entities_path, "w", encoding="utf-8") as f:
-        json.dump(data.extracted_entities, f, ensure_ascii=False)
+        json.dump({"version": ENTITIES_VERSION, "entities": data.extracted_entities},
+                  f, ensure_ascii=False)
     _print(f"  [Checkpoint] Saved {len(data.extracted_entities)} entities to {entities_path}")
 
 
@@ -530,6 +557,7 @@ def _save_graph_checkpoint(data: PipelineData, phase: str):
     cp_path = os.path.join(out_root, "graph_checkpoint.json")
     cp = {
         "completed_phase": phase,
+        "id_scheme": ID_SCHEME,
         "file_id_map": data.file_id_map,
         "class_id_map": data.class_id_map,
         "method_id_map": data.method_id_map,
@@ -552,6 +580,13 @@ def _load_graph_checkpoint(data: PipelineData) -> str | None:
     try:
         with open(cp_path, "r", encoding="utf-8") as f:
             cp = json.load(f)
+        # ID scheme changed (relative-path hashing + FQCN keys) — a checkpoint
+        # from an older scheme holds incompatible IDs; discard and rebuild from
+        # Phase 8 so we never mix ID formats in one graph.
+        if cp.get("id_scheme") != ID_SCHEME:
+            _print("[Resume] graph_checkpoint.json uses an old ID scheme — "
+                   "rebuilding nodes/edges from Phase 8")
+            return None
         data.file_id_map = cp.get("file_id_map", {})
         data.class_id_map = cp.get("class_id_map", {})
         data.method_id_map = cp.get("method_id_map", {})
@@ -571,18 +606,63 @@ def _load_graph_checkpoint(data: PipelineData) -> str | None:
 # ===================================================================
 
 
+def _rel_origin(rel: str) -> str:
+    """'vendor' if the relative path passes through a vendor/ dir, else 'app'."""
+    return "vendor" if "vendor" in rel.split(os.sep) else "app"
+
+
+def _is_app_file(data: PipelineData, fp: str) -> bool:
+    rel = os.path.relpath(fp, data.target_dir)
+    return data.file_origins.get(rel, "app") == "app"
+
+
+def vendor_stats(target_dir: str) -> dict:
+    """Count source files + total bytes under any vendor/ directory.
+
+    Feeds the include-vendor prompt so the user sees the scale of what they'd
+    be adding to the graph before deciding.
+    """
+    abs_path = os.path.abspath(target_dir)
+    skip = {d for d in config.SKIP_DIRS if d != "vendor"}
+    count = 0
+    total = 0
+    for root, dirs, files in os.walk(abs_path):
+        dirs[:] = [d for d in dirs if d not in skip and not d.startswith(".")]
+        if "vendor" not in os.path.relpath(root, abs_path).split(os.sep):
+            continue
+        for f in files:
+            if os.path.splitext(f)[1].lower() in config.SOURCE_EXTENSIONS:
+                count += 1
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    return {"files": count, "bytes": total}
+
+
 def phase1_scan(data: PipelineData):
     t0 = time.time()
     abs_path = os.path.abspath(data.target_dir)
     data.target_dir = abs_path
 
+    # vendor/ is skipped by default; including it keeps vendor files in the
+    # scan (tagged origin='vendor') for graph nodes/edges + LSP resolution.
+    skip_dirs = set(config.SKIP_DIRS)
+    if data.include_vendor:
+        skip_dirs.discard("vendor")
+
     source_files = []
     for root, dirs, files in os.walk(abs_path):
-        dirs[:] = [d for d in dirs if d not in config.SKIP_DIRS and not d.startswith(".")]
+        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
         for f in sorted(files):
             ext = os.path.splitext(f)[1].lower()
             if ext in config.SOURCE_EXTENSIONS:
                 source_files.append(os.path.join(root, f))
+
+    data.file_origins = {
+        os.path.relpath(fp, abs_path): _rel_origin(os.path.relpath(fp, abs_path))
+        for fp in source_files
+    }
 
     # Build directory tree
     dir_children = defaultdict(lambda: {"files": [], "subdirs": set()})
@@ -708,9 +788,11 @@ async def phase2_file_summaries(data: PipelineData, client: genai.Client):
 
     t0 = time.time()
     _throttle.reset()
-    total = len(data.file_list)
+    # Vendor files get graph nodes but no Gemini docs (cost) — app files only.
+    app_files = [fp for fp in data.file_list if _is_app_file(data, fp)]
+    total = len(app_files)
 
-    pending = [fp for fp in data.file_list if fp not in data.file_summaries]
+    pending = [fp for fp in app_files if fp not in data.file_summaries]
 
     if not pending:
         _print(f"[Phase 2] All {total} files already summarized (resumed), skipping")
@@ -1664,6 +1746,137 @@ def _batch_insert(db, table: str, columns: list[str], rows: list[list], max_retr
 # ===================================================================
 
 
+# Column lists are derived from the Spanner schema spec so Phase 8/9 inserts
+# always match the DDL. Only the tables the pipeline currently writes are
+# pulled in; DbTables/TableReferences/ClassMapsToTable rows are added by the
+# migration phase.
+from .setup_spanner_graph import write_columns as _write_columns
+
+NODE_COLUMNS = {t: _write_columns(t)
+                for t in ("Files", "Classes", "Methods", "Modules",
+                          "Directories", "DbTables")}
+
+
+def _member_fqmn(cls: dict, meth: dict, namespace: str) -> str:
+    """Globally-unique human identity: `NS\\Class::member` for class members,
+    the namespaced function name for (global) functions."""
+    mname = meth.get("name", "")
+    if cls.get("name") == "(global)":
+        return f"{namespace}\\{mname}" if namespace else mname
+    fqcn = cls.get("fqcn") or cls.get("name", "")
+    return f"{fqcn}::{mname}"
+
+
+def build_node_rows(data: PipelineData) -> dict[str, Any]:
+    """Pure derivation of all node rows + ID maps (no Spanner access).
+
+    IDs hash **target-relative** paths (portable across machines) plus FQCN,
+    so identically-named classes/methods in different files/namespaces/projects
+    can never share a node; ID_PREFIX separates projects sharing a database.
+    """
+    target = data.target_dir
+
+    def _rel(p: str) -> str:
+        return os.path.relpath(p, target) if target else p
+
+    origins = data.file_origins or {}
+
+    rows: dict[str, list[list]] = {t: [] for t in NODE_COLUMNS}
+    file_id_map: dict[str, str] = {}
+    class_id_map: dict[str, str] = {}
+    method_id_map: dict[str, str] = {}
+    module_id_map: dict[str, str] = {}
+    dir_id_map: dict[str, str] = {}
+
+    for fp in data.file_list:
+        rel = _rel(fp)
+        fid = _make_id("file", rel)
+        file_id_map[fp] = fid
+        origin = origins.get(rel, "app")
+        summary = data.file_summaries.get(fp, "")
+        rows["Files"].append([fid, os.path.basename(fp), os.path.splitext(fp)[1],
+                              os.path.dirname(rel), rel, origin, summary[:4000]])
+
+    for fp, ent in data.extracted_entities.items():
+        rel = _rel(fp)
+        origin = origins.get(rel, "app")
+        namespace = ent.get("namespace", "")
+        for cls in ent.get("classes", []):
+            cname = cls.get("name", "")
+            if not cname:
+                continue
+            fqcn = cls.get("fqcn") or ""
+            cid = _make_id("class", rel, fqcn or cname)
+            class_id_map[f"{fp}|{cname}"] = cid
+            rows["Classes"].append([
+                cid, cname, namespace, fqcn, file_id_map.get(fp, ""),
+                cls.get("kind", "class"), cls.get("modifiers", ""),
+                cls.get("start_line", 0), cls.get("end_line", 0), origin,
+                f"{fqcn or cname}: {cls.get('kind', 'class')}",
+            ])
+            for meth in cls.get("methods", []):
+                mname = meth.get("name", "")
+                if not mname:
+                    continue
+                fqmn = _member_fqmn(cls, meth, namespace)
+                mid = _make_id("method", rel, fqcn or cname, mname)
+                method_id_map[f"{fp}|{cname}|{mname}"] = mid
+                sig = (f"{meth.get('return_type', 'void')} {cname}.{mname}"
+                       f"({meth.get('parameters', '')})")
+                rows["Methods"].append([
+                    mid, mname, cid, file_id_map.get(fp, ""), fqmn, sig,
+                    meth.get("modifiers", ""), meth.get("return_type", ""),
+                    meth.get("start_line", 0), meth.get("end_line", 0), origin,
+                    fqmn,
+                ])
+
+    for topic in data.topics:
+        tname = topic.get("name", "")
+        if not tname:
+            continue
+        tid = _make_id("module", tname)
+        module_id_map[tname] = tid
+        rows["Modules"].append([tid, tname,
+                                data.topic_summaries.get(tname, "")[:4000]])
+
+    for dp in data.dir_queue:
+        did = _make_id("dir", _rel(dp))
+        dir_id_map[dp] = did
+        rows["Directories"].append([did, os.path.basename(dp),
+                                    data.dir_summaries.get(dp, "")[:4000]])
+
+    # -- DbTables (from Phase 1.7 migration schema) --
+    dbtable_id_map: dict[str, str] = {}
+    for tname, tbl in (data.db_schema or {}).get("tables", {}).items():
+        tid = _make_id("dbtable", tname)
+        dbtable_id_map[tname] = tid
+        src = tbl.get("source_file", "")
+        plugin = ""
+        segs = src.replace(os.sep, "/").split("/")
+        if "plugins" in segs:
+            i = segs.index("plugins")
+            if i + 1 < len(segs):
+                plugin = segs[i + 1]
+        rows["DbTables"].append([
+            tid, tname,
+            json.dumps(tbl.get("columns", []), ensure_ascii=False),
+            json.dumps(tbl.get("indexes", []), ensure_ascii=False),
+            json.dumps(tbl.get("foreign_keys", []), ensure_ascii=False),
+            src, plugin,
+            f"{tname}: {len(tbl.get('columns', []))} columns",
+        ])
+
+    return {
+        "rows": rows,
+        "file_id_map": file_id_map,
+        "class_id_map": class_id_map,
+        "method_id_map": method_id_map,
+        "module_id_map": module_id_map,
+        "dir_id_map": dir_id_map,
+        "dbtable_id_map": dbtable_id_map,
+    }
+
+
 def phase8_write_nodes(data: PipelineData):
     t0 = time.time()
 
@@ -1672,116 +1885,389 @@ def phase8_write_nodes(data: PipelineData):
         data.timings["phase8_write_nodes"] = 0.0
         return
 
+    built = build_node_rows(data)
     db = _get_spanner_db()
 
-    # -- File nodes (from scan — deterministic, enriched with LLM summaries if available) --
-    file_rows = []
-    file_id_map: dict[str, str] = {}
-    for fp in data.file_list:
-        fid = _make_id("file", fp)
-        file_id_map[fp] = fid
-        ext = os.path.splitext(fp)[1]
-        directory = os.path.dirname(os.path.relpath(fp, data.target_dir)) if data.target_dir else ""
-        summary = data.file_summaries.get(fp, "")
-        file_rows.append([fid, os.path.basename(fp), ext, directory, summary[:4000]])
+    counts = {}
+    for table, columns in NODE_COLUMNS.items():
+        rows = built["rows"][table]
+        counts[table] = len(rows)
+        if rows:
+            _batch_insert(db, table, columns, rows)
+            _print(f"  [Phase 8] Wrote {len(rows)} {table} nodes")
 
-    if file_rows:
-        _batch_insert(db, "Files", ["file_id", "file_name", "extension", "directory", "summary"], file_rows)
-        _print(f"  [Phase 8] Wrote {len(file_rows)} file nodes")
-
-    # -- Class nodes --
-    class_rows = []
-    class_id_map: dict[str, str] = {}
-    for fp, ent in data.extracted_entities.items():
-        for cls in ent.get("classes", []):
-            cname = cls.get("name", "")
-            if not cname:
-                continue
-            cid = _make_id("class", fp, cname)
-            key = f"{fp}|{cname}"
-            class_id_map[key] = cid
-            class_rows.append([
-                cid, cname, file_id_map.get(fp, ""),
-                cls.get("kind", "class"), cls.get("modifiers", ""),
-                f"{cname}: {cls.get('kind', 'class')}",
-            ])
-
-    if class_rows:
-        _batch_insert(db, "Classes", ["class_id", "name", "file_id", "kind", "modifiers", "summary"], class_rows)
-        _print(f"  [Phase 8] Wrote {len(class_rows)} class nodes")
-
-    # -- Method nodes --
-    method_rows = []
-    method_id_map: dict[str, str] = {}
-    for fp, ent in data.extracted_entities.items():
-        for cls in ent.get("classes", []):
-            cname = cls.get("name", "")
-            for meth in cls.get("methods", []):
-                mname = meth.get("name", "")
-                if not mname:
-                    continue
-                mid = _make_id("method", fp, cname, mname)
-                method_id_map[f"{fp}|{cname}|{mname}"] = mid
-                cid = class_id_map.get(f"{fp}|{cname}", "")
-                sig = f"{meth.get('return_type', 'void')} {cname}.{mname}({meth.get('parameters', '')})"
-                method_rows.append([
-                    mid, mname, cid, file_id_map.get(fp, ""),
-                    sig, meth.get("modifiers", ""),
-                    meth.get("return_type", ""),
-                    f"{cname}.{mname}",
-                ])
-
-    if method_rows:
-        _batch_insert(db, "Methods",
-                      ["method_id", "name", "class_id", "file_id", "signature", "modifiers", "return_type", "summary"],
-                      method_rows)
-        _print(f"  [Phase 8] Wrote {len(method_rows)} method nodes")
-
-    # -- Module nodes (from topics) --
-    module_rows = []
-    module_id_map: dict[str, str] = {}
-    for topic in data.topics:
-        tname = topic.get("name", "")
-        if not tname:
-            continue
-        tid = _make_id("module", tname)
-        module_id_map[tname] = tid
-        summary = data.topic_summaries.get(tname, "")
-        module_rows.append([tid, tname, summary[:4000]])
-
-    if module_rows:
-        _batch_insert(db, "Modules", ["module_id", "name", "summary"], module_rows)
-        _print(f"  [Phase 8] Wrote {len(module_rows)} module nodes")
-
-    # -- Directory nodes (from scan — deterministic, enriched with LLM summaries if available) --
-    dir_rows = []
-    dir_id_map: dict[str, str] = {}
-    for dp in data.dir_queue:
-        did = _make_id("dir", dp)
-        dir_id_map[dp] = did
-        summary = data.dir_summaries.get(dp, "")
-        dir_rows.append([did, os.path.basename(dp), summary[:4000]])
-
-    if dir_rows:
-        _batch_insert(db, "Directories", ["dir_id", "name", "summary"], dir_rows)
-        _print(f"  [Phase 8] Wrote {len(dir_rows)} directory nodes")
-
-    # Persist ID maps
-    data.file_id_map = file_id_map
-    data.class_id_map = class_id_map
-    data.method_id_map = method_id_map
-    data.module_id_map = module_id_map
-    data.dir_id_map = dir_id_map
+    data.file_id_map = built["file_id_map"]
+    data.class_id_map = built["class_id_map"]
+    data.method_id_map = built["method_id_map"]
+    data.module_id_map = built["module_id_map"]
+    data.dir_id_map = built["dir_id_map"]
+    data.dbtable_id_map = built["dbtable_id_map"]
 
     elapsed = time.time() - t0
     data.timings["phase8_write_nodes"] = elapsed
-    _print(f"[Phase 8] Wrote {len(file_rows)} files, {len(class_rows)} classes, "
-           f"{len(method_rows)} methods, {len(module_rows)} modules, {len(dir_rows)} dirs in {elapsed:.1f}s")
+    _print(f"[Phase 8] Wrote nodes in {elapsed:.1f}s: {counts}")
 
 
 # ===================================================================
 # Phase 9: Write Graph Edges
 # ===================================================================
+
+
+EDGE_COLUMNS = {t: _write_columns(t) for t in (
+    "FileImports", "FileDependsOn", "ClassInherits", "MethodCalls",
+    "PossiblyCalls", "FileDefinesClass", "ClassDefinesMethod",
+    "FileBelongsToModule", "DirContainsFile", "TableReferences",
+    "ClassMapsToTable")}
+
+
+def derive_edge_rows(data: PipelineData) -> dict[str, Any]:
+    """Pure edge derivation from Phase 1.6 resolutions (no Spanner access).
+
+    The zero-wrong-edge contract lives here: MethodCalls/ClassInherits/
+    FileImports rows are emitted **only** from `resolved` records whose target
+    is an internal node, each carrying its `resolution` provenance. Ambiguous/
+    dynamic/unresolved calls go to PossiblyCalls (candidate fan-out capped by
+    config.POSSIBLY_CALLS_MAX_CANDIDATES); confirmed-external targets are
+    counted, never guessed into edges. The pre-resolution simple-name maps
+    (first-definition-wins) are gone.
+    """
+    target = data.target_dir
+
+    def _rel(p: str) -> str:
+        return os.path.relpath(p, target) if target else p
+
+    abs_by_rel = {_rel(fp): fp for fp in data.file_list}
+    res_files = (data.resolutions or {}).get("files", {})
+
+    # ── lookup tables (exact identity, never name-first-wins) ────
+    class_id_by_key: dict[tuple[str, str], str] = {}   # (rel, norm fqcn|name) → id
+    method_id_by_key: dict[tuple[str, str, str], str] = {}  # (rel, norm fqcn|cname, norm member)
+    caller_id_by_site: dict[tuple[str, str, str], str] = {}  # (rel, norm cname, norm mname)
+    function_id_by_key: dict[tuple[str, str], str] = {}  # (rel, norm fq function name)
+    method_ids_by_name: dict[str, list[str]] = {}       # norm name → ids (methods only)
+
+    for fp, ent in data.extracted_entities.items():
+        rel = _rel(fp)
+        ns = ent.get("namespace", "")
+        for cls in ent.get("classes", []):
+            cname = cls.get("name", "")
+            fqcn = cls.get("fqcn") or ""
+            cid = data.class_id_map.get(f"{fp}|{cname}", "")
+            if cid:
+                if fqcn:
+                    class_id_by_key[(rel, fqcn.lower())] = cid
+                class_id_by_key.setdefault((rel, cname.lower()), cid)
+            for meth in cls.get("methods", []):
+                mname = meth.get("name", "")
+                mid = data.method_id_map.get(f"{fp}|{cname}|{mname}", "")
+                if not mid:
+                    continue
+                caller_id_by_site[(rel, cname.lower(), mname.lower())] = mid
+                if cls.get("name") == "(global)":
+                    fq_fn = f"{ns}\\{mname}" if ns else mname
+                    function_id_by_key[(rel, fq_fn.lower())] = mid
+                    method_ids_by_name.setdefault(mname.lower(), []).append(mid)
+                else:
+                    key_cls = (fqcn or cname).lower()
+                    method_id_by_key[(rel, key_cls, mname.lower())] = mid
+                    if meth.get("member_kind", "method") in ("method", "function"):
+                        method_ids_by_name.setdefault(mname.lower(), []).append(mid)
+
+    def _target_method_id(tgt: dict) -> str:
+        path = tgt.get("path", "")
+        member = (tgt.get("member") or "").lower()
+        fqcn = (tgt.get("fqcn") or "").lower()
+        if not member:
+            return ""
+        if fqcn:
+            return method_id_by_key.get((path, fqcn, member), "")
+        # (global) function targets carry the namespaced name in `member`
+        return function_id_by_key.get((path, member), "")
+
+    def _caller_method_id(rel: str, site: dict) -> str:
+        return caller_id_by_site.get(
+            (rel, (site.get("class") or "").lower(),
+             (site.get("method") or "").lower()), "")
+
+    rows: dict[str, list[list]] = {t: [] for t in EDGE_COLUMNS}
+    stats: dict[str, int] = {}
+
+    def _count(key: str, n: int = 1):
+        stats[key] = stats.get(key, 0) + n
+
+    seen_calls: set[tuple[str, str]] = set()
+    seen_pcalls: set[tuple[str, str]] = set()
+    seen_deps: set[tuple[str, str]] = set()
+    seen_imports: set[tuple[str, str]] = set()
+
+    def _dep(src_fid: str, tgt_rel: str):
+        tgt_fp = abs_by_rel.get(tgt_rel)
+        if not tgt_fp:
+            return
+        tgt_fid = data.file_id_map.get(tgt_fp, "")
+        if tgt_fid and src_fid and tgt_fid != src_fid \
+                and (src_fid, tgt_fid) not in seen_deps:
+            seen_deps.add((src_fid, tgt_fid))
+            rows["FileDependsOn"].append(
+                [_make_id("dep", src_fid, tgt_fid), src_fid, tgt_fid, "resolved"])
+
+    def _method_call_edge(caller_id: str, callee_id: str, name: str,
+                          via: str, line: int):
+        if not caller_id or not callee_id or caller_id == callee_id:
+            return
+        if (caller_id, callee_id) in seen_calls:
+            return
+        seen_calls.add((caller_id, callee_id))
+        rows["MethodCalls"].append(
+            [_make_id("calls", caller_id, callee_id), caller_id, callee_id,
+             name, via, line])
+
+    def _possibly_edge(caller_id: str, callee_id: str, name: str,
+                       reason: str, count: int):
+        if not caller_id or not callee_id or caller_id == callee_id:
+            return
+        if (caller_id, callee_id) in seen_pcalls:
+            return
+        seen_pcalls.add((caller_id, callee_id))
+        rows["PossiblyCalls"].append(
+            [_make_id("pcalls", caller_id, callee_id), caller_id, callee_id,
+             name, reason, count])
+
+    cap = config.POSSIBLY_CALLS_MAX_CANDIDATES
+
+    for rel, frec in res_files.items():
+        fp = abs_by_rel.get(rel)
+        src_fid = data.file_id_map.get(fp, "") if fp else ""
+
+        # -- calls / props / callable class_refs → MethodCalls | PossiblyCalls --
+        call_like = list(frec.get("calls", [])) + list(frec.get("props", []))
+        for r in call_like:
+            site = r.get("site", {})
+            status = r.get("status", "unresolved")
+            caller_id = _caller_method_id(rel, site)
+            tgt = r.get("target") or {}
+
+            # String-convention class refs contribute file dependencies
+            st = r.get("string_target")
+            if st and r.get("string_internal"):
+                _dep(src_fid, st.get("path", ""))
+            ct = r.get("callable_target")
+            if ct and r.get("callable_internal"):
+                cid = _target_method_id(ct)
+                _method_call_edge(caller_id, cid, ct.get("member", ""),
+                                  "convention:callable_literal",
+                                  site.get("line", 0))
+                _dep(src_fid, ct.get("path", ""))
+
+            if status == "resolved":
+                path = tgt.get("path", "")
+                if path in res_files or path in abs_by_rel:
+                    callee_id = _target_method_id(tgt)
+                    if callee_id:
+                        _method_call_edge(caller_id, callee_id,
+                                          site.get("name") or tgt.get("member", ""),
+                                          r.get("via", ""), site.get("line", 0))
+                        _count("calls_resolved")
+                    else:
+                        _count("calls_resolved_no_member")  # class-level target
+                    _dep(src_fid, path)
+                else:
+                    _count("calls_resolved_uninternal")
+            elif status == "external":
+                _count("calls_external")
+            elif status == "ambiguous":
+                cands = r.get("candidates", [])
+                internal_ids = [
+                    _target_method_id(c) for c in cands
+                    if (c.get("path", "") in abs_by_rel or not c.get("path"))]
+                internal_ids = [
+                    i or method_id_by_key.get(
+                        (rel, (c.get("fqcn") or "").lower(),
+                         (c.get("member") or "").lower()), "")
+                    for i, c in zip(internal_ids, cands)]
+                internal_ids = [i for i in internal_ids if i]
+                if not internal_ids:
+                    # LSB candidates carry fqcn but no path — search all files
+                    for c in cands:
+                        fq = (c.get("fqcn") or "").lower()
+                        mb = (c.get("member") or "").lower()
+                        for (krel, kfq, km), mid in method_id_by_key.items():
+                            if kfq == fq and km == mb:
+                                internal_ids.append(mid)
+                if internal_ids and len(internal_ids) <= cap:
+                    for cid in dict.fromkeys(internal_ids):
+                        _possibly_edge(caller_id, cid, site.get("name", ""),
+                                       "ambiguous", len(internal_ids))
+                    _count("calls_ambiguous")
+                else:
+                    _count("calls_ambiguous_capped" if internal_ids
+                           else "calls_ambiguous_no_internal")
+            elif status == "dynamic":
+                _count("calls_dynamic")
+            else:  # unresolved → name-heuristic candidates, capped
+                name = (site.get("name") or "").lower()
+                if not name:
+                    _count("calls_unresolved_unnamed")
+                    continue
+                cand_ids = [i for i in method_ids_by_name.get(name, [])
+                            if i != caller_id]
+                if not cand_ids:
+                    _count("calls_unresolved_no_candidates")
+                elif len(cand_ids) > cap:
+                    _count("calls_unresolved_fanout_capped")
+                else:
+                    for cid in cand_ids:
+                        _possibly_edge(caller_id, cid, site.get("name", ""),
+                                       "name-heuristic", len(cand_ids))
+                    _count("calls_unresolved_heuristic")
+
+        # -- class_refs (class_literal / array_callable) --
+        for r in frec.get("class_refs", []):
+            if r.get("status") != "resolved":
+                continue
+            tgt = r.get("target") or {}
+            path = tgt.get("path", "")
+            if path not in abs_by_rel:
+                continue
+            _dep(src_fid, path)
+            if tgt.get("member"):
+                caller_id = _caller_method_id(rel, r.get("site", {}))
+                _method_call_edge(caller_id, _target_method_id(tgt),
+                                  tgt.get("member", ""),
+                                  r.get("via", "convention:array_callable"),
+                                  r.get("site", {}).get("line", 0))
+
+        # -- inherits → ClassInherits --
+        for r in frec.get("inherits", []):
+            status = r.get("status")
+            if status == "external":
+                _count("inherits_external")
+                continue
+            if status != "resolved":
+                _count("inherits_unresolved")
+                continue
+            tgt = r.get("target") or {}
+            child_id = class_id_by_key.get(
+                (rel, (r.get("class_fqcn") or r.get("class") or "").lower()), "")
+            parent_id = class_id_by_key.get(
+                (tgt.get("path", ""), (tgt.get("fqcn") or "").lower()), "")
+            if child_id and parent_id and child_id != parent_id:
+                rows["ClassInherits"].append(
+                    [_make_id("inherits", child_id, parent_id), child_id,
+                     parent_id, r.get("relation", "extends"), r.get("via", "")])
+                _dep(src_fid, tgt.get("path", ""))
+            else:
+                _count("inherits_unmapped")
+
+        # -- imports → FileImports + FileDependsOn --
+        for r in frec.get("imports", []):
+            if r.get("status") != "resolved":
+                continue
+            tgt_rel = r.get("target_path") or ""
+            tgt_fp = abs_by_rel.get(tgt_rel)
+            tgt_fid = data.file_id_map.get(tgt_fp, "") if tgt_fp else ""
+            if src_fid and tgt_fid and src_fid != tgt_fid \
+                    and (src_fid, tgt_fid) not in seen_imports:
+                seen_imports.add((src_fid, tgt_fid))
+                rows["FileImports"].append(
+                    [_make_id("imp", src_fid, tgt_fid), src_fid, tgt_fid,
+                     r.get("fqcn", ""), "resolved"])
+                _dep(src_fid, tgt_rel)
+
+    # ── structural edges (ID-map based — unchanged semantics) ────
+    for fp, ent in data.extracted_entities.items():
+        fid = data.file_id_map.get(fp, "")
+        for cls in ent.get("classes", []):
+            cname = cls.get("name", "")
+            cid = data.class_id_map.get(f"{fp}|{cname}", "")
+            if fid and cid:
+                rows["FileDefinesClass"].append(
+                    [_make_id("fdc", fid, cid), fid, cid])
+            if not cid:
+                continue
+            for meth in cls.get("methods", []):
+                mid = data.method_id_map.get(f"{fp}|{cname}|{meth.get('name', '')}", "")
+                if mid:
+                    rows["ClassDefinesMethod"].append(
+                        [_make_id("cdm", cid, mid), cid, mid])
+
+    basename_to_fp: dict[str, str] = {}
+    _bn_counts: dict[str, int] = {}
+    for fp in data.file_list:
+        bn = os.path.splitext(os.path.basename(fp))[0]
+        _bn_counts[bn] = _bn_counts.get(bn, 0) + 1
+        basename_to_fp[bn] = fp
+    for bn, cnt in _bn_counts.items():
+        if cnt > 1:
+            del basename_to_fp[bn]  # ambiguous basename — never guess
+
+    for topic in data.topics:
+        mid = data.module_id_map.get(topic.get("name", ""), "")
+        if not mid:
+            continue
+        for fname in topic.get("linked_files", []):
+            fp = basename_to_fp.get(os.path.splitext(fname)[0])
+            if fp:
+                fid = data.file_id_map.get(fp, "")
+                if fid:
+                    rows["FileBelongsToModule"].append(
+                        [_make_id("fbm", fid, mid), fid, mid])
+
+    for dp, info in data.dir_tree.items():
+        did = data.dir_id_map.get(dp, "")
+        if not did:
+            continue
+        for fp in info.get("files", []):
+            fid = data.file_id_map.get(fp, "")
+            if fid:
+                rows["DirContainsFile"].append(
+                    [_make_id("dcf", did, fid), did, fid])
+
+    # ── DB schema edges (Phase 1.7) ──────────────────────────────
+    from .php_conventions import tableize
+    dbtable_ids = data.dbtable_id_map or {}
+    for tname, tbl in (data.db_schema or {}).get("tables", {}).items():
+        src_tid = dbtable_ids.get(tname, "")
+        if not src_tid:
+            continue
+        for fk in tbl.get("foreign_keys", []):
+            tgt_tid = dbtable_ids.get(fk.get("referenced_table", ""), "")
+            if tgt_tid:
+                rows["TableReferences"].append([
+                    _make_id("tref", src_tid, tgt_tid, fk.get("column", "")),
+                    src_tid, tgt_tid, fk.get("column", ""),
+                    fk.get("referenced_column", ""),
+                ])
+
+    # ClassMapsToTable: CakePHP Table class → DbTable, by setTable() literal
+    # (authoritative) else the Inflector table-name convention. Only emitted
+    # when the target table actually exists in the schema.
+    for fp, ent in data.extracted_entities.items():
+        for cls in ent.get("classes", []):
+            fqcn = cls.get("fqcn") or ""
+            if "\\Model\\Table\\" not in fqcn or not fqcn.endswith("Table"):
+                continue
+            cid = data.class_id_map.get(f"{fp}|{cls.get('name', '')}", "")
+            if not cid:
+                continue
+            table_name, via = None, "convention"
+            for m in cls.get("methods", []):
+                for site in m.get("call_sites", []):
+                    if (site.get("name") or "").lower() == "settable":
+                        args = site.get("str_args") or []
+                        if args and isinstance(args[0], str):
+                            table_name, via = args[0], "settable"
+                            break
+                if table_name:
+                    break
+            if not table_name:
+                table_name = tableize(cls.get("name", ""))
+            tid = dbtable_ids.get(table_name, "")
+            if tid:
+                rows["ClassMapsToTable"].append(
+                    [_make_id("c2t", cid, tid), cid, tid, via])
+
+    return {"rows": rows, "stats": stats}
 
 
 def phase9_write_edges(data: PipelineData):
@@ -1792,204 +2278,13 @@ def phase9_write_edges(data: PipelineData):
         data.timings["phase9_write_edges"] = 0.0
         return
 
+    derived = derive_edge_rows(data)
     db = _get_spanner_db()
 
-    # Build lookups (skip ambiguous basenames to avoid wrong deps)
-    basename_to_fp: dict[str, str] = {}
-    _bn_counts: dict[str, int] = {}
-    for fp in data.file_list:
-        bn = os.path.splitext(os.path.basename(fp))[0]
-        _bn_counts[bn] = _bn_counts.get(bn, 0) + 1
-        basename_to_fp[bn] = fp
-    for bn, cnt in _bn_counts.items():
-        if cnt > 1:
-            del basename_to_fp[bn]  # ambiguous — skip
-
-    classname_to_id: dict[str, str] = {}
-    for key, cid in data.class_id_map.items():
-        cname = key.split("|", 1)[1] if "|" in key else key
-        if cname not in classname_to_id:
-            classname_to_id[cname] = cid
-
-    methodname_to_id: dict[str, str] = {}
-    for key, mid in data.method_id_map.items():
-        parts = key.rsplit("|", 1)
-        mname = parts[-1] if parts else key
-        if mname not in methodname_to_id:
-            methodname_to_id[mname] = mid
-
-    counts: dict[str, int] = {}
-
-    # -- FileDependsOn --
-    dep_rows = []
-    seen_deps: set[tuple[str, str]] = set()
-
-    for fp, ent in data.extracted_entities.items():
-        src_id = data.file_id_map.get(fp, "")
-        if not src_id:
-            continue
-        for imp in ent.get("imports", []):
-            imp_name = imp.rsplit(".", 1)[-1] if "." in imp else imp
-            imp_name = imp_name.rsplit("/", 1)[-1] if "/" in imp_name else imp_name
-            target_fp = basename_to_fp.get(imp_name)
-            if target_fp and target_fp != fp:
-                tgt_id = data.file_id_map.get(target_fp, "")
-                if tgt_id and (src_id, tgt_id) not in seen_deps:
-                    seen_deps.add((src_id, tgt_id))
-                    eid = _make_id("dep", src_id, tgt_id)
-                    dep_rows.append([eid, src_id, tgt_id])
-
-    # Same-package implicit dependencies (uses extracted entity data, no disk I/O)
-    package_files: dict[str, list[tuple[str, set[str], set[str]]]] = {}
-    for fp, ent in data.extracted_entities.items():
-        pkg = ent.get("namespace", "") or os.path.dirname(fp)
-        defined_names = {c.get("name", "") for c in ent.get("classes", []) if c.get("name")}
-        # Collect referenced names: base classes, interfaces, method call targets
-        referenced_names: set[str] = set()
-        for cls in ent.get("classes", []):
-            referenced_names.update(cls.get("base_classes", []))
-            referenced_names.update(cls.get("interfaces", []))
-            for meth in cls.get("methods", []):
-                for call in meth.get("calls", []):
-                    # Extract class part from "Obj.Method" patterns
-                    if "." in call:
-                        referenced_names.add(call.split(".")[0])
-        if pkg not in package_files:
-            package_files[pkg] = []
-        package_files[pkg].append((fp, defined_names, referenced_names))
-
-    for pkg, pkg_members in package_files.items():
-        if len(pkg_members) < 2:
-            continue
-        classname_to_file: dict[str, str] = {}
-        for fp, defined, _ in pkg_members:
-            for cn in defined:
-                classname_to_file[cn] = fp
-        for fp, own_classes, refs in pkg_members:
-            src_id = data.file_id_map.get(fp, "")
-            if not src_id:
-                continue
-            for ref_name in refs:
-                defining_fp = classname_to_file.get(ref_name)
-                if defining_fp and defining_fp != fp:
-                    tgt_id = data.file_id_map.get(defining_fp, "")
-                    if tgt_id and (src_id, tgt_id) not in seen_deps:
-                        seen_deps.add((src_id, tgt_id))
-                        eid = _make_id("dep", src_id, tgt_id)
-                        dep_rows.append([eid, src_id, tgt_id])
-
-    counts["FileDependsOn"] = len(dep_rows)
-
-    # -- ClassInherits --
-    inherit_rows = []
-    for fp, ent in data.extracted_entities.items():
-        for cls in ent.get("classes", []):
-            cname = cls.get("name", "")
-            child_id = data.class_id_map.get(f"{fp}|{cname}", "")
-            if not child_id:
-                continue
-            for base in cls.get("base_classes", []) + cls.get("interfaces", []):
-                parent_id = classname_to_id.get(base, "")
-                if parent_id and parent_id != child_id:
-                    eid = _make_id("inherits", child_id, parent_id)
-                    inherit_rows.append([eid, child_id, parent_id, "extends"])
-
-    counts["ClassInherits"] = len(inherit_rows)
-
-    # -- MethodCalls --
-    call_rows = []
-    for fp, ent in data.extracted_entities.items():
-        for cls in ent.get("classes", []):
-            cname = cls.get("name", "")
-            for meth in cls.get("methods", []):
-                mname = meth.get("name", "")
-                caller_id = data.method_id_map.get(f"{fp}|{cname}|{mname}", "")
-                if not caller_id:
-                    continue
-                for call_target in meth.get("calls", []):
-                    callee_name = call_target.rsplit(".", 1)[-1] if "." in call_target else call_target
-                    callee_id = methodname_to_id.get(callee_name, "")
-                    if callee_id and callee_id != caller_id:
-                        eid = _make_id("calls", caller_id, callee_id)
-                        call_rows.append([eid, caller_id, callee_id, call_target])
-
-    counts["MethodCalls"] = len(call_rows)
-
-    # -- FileDefinesClass --
-    fdc_rows = []
-    for fp, ent in data.extracted_entities.items():
-        fid = data.file_id_map.get(fp, "")
-        if not fid:
-            continue
-        for cls in ent.get("classes", []):
-            cname = cls.get("name", "")
-            cid = data.class_id_map.get(f"{fp}|{cname}", "")
-            if cid:
-                eid = _make_id("fdc", fid, cid)
-                fdc_rows.append([eid, fid, cid])
-
-    counts["FileDefinesClass"] = len(fdc_rows)
-
-    # -- ClassDefinesMethod --
-    cdm_rows = []
-    for fp, ent in data.extracted_entities.items():
-        for cls in ent.get("classes", []):
-            cname = cls.get("name", "")
-            cid = data.class_id_map.get(f"{fp}|{cname}", "")
-            if not cid:
-                continue
-            for meth in cls.get("methods", []):
-                mname = meth.get("name", "")
-                mid = data.method_id_map.get(f"{fp}|{cname}|{mname}", "")
-                if mid:
-                    eid = _make_id("cdm", cid, mid)
-                    cdm_rows.append([eid, cid, mid])
-
-    counts["ClassDefinesMethod"] = len(cdm_rows)
-
-    # -- FileBelongsToModule --
-    fbm_rows = []
-    # Reuse basename_to_fp for file lookups
-    for topic in data.topics:
-        tname = topic.get("name", "")
-        mid = data.module_id_map.get(tname, "")
-        if not mid:
-            continue
-        for fname in topic.get("linked_files", []):
-            fp = basename_to_fp.get(os.path.splitext(fname)[0])
-            if fp:
-                fid = data.file_id_map.get(fp, "")
-                if fid:
-                    eid = _make_id("fbm", fid, mid)
-                    fbm_rows.append([eid, fid, mid])
-
-    counts["FileBelongsToModule"] = len(fbm_rows)
-
-    # -- DirContainsFile --
-    dcf_rows = []
-    for dp, info in data.dir_tree.items():
-        did = data.dir_id_map.get(dp, "")
-        if not did:
-            continue
-        for fp in info.get("files", []):
-            fid = data.file_id_map.get(fp, "")
-            if fid:
-                eid = _make_id("dcf", did, fid)
-                dcf_rows.append([eid, did, fid])
-    counts["DirContainsFile"] = len(dcf_rows)
-
-    # -- Write all 7 edge types in parallel --
     from concurrent.futures import ThreadPoolExecutor
 
-    edge_writes = [
-        ("FileDependsOn", ["edge_id", "source_file", "target_file"], dep_rows),
-        ("ClassInherits", ["edge_id", "child_class", "parent_class", "kind"], inherit_rows),
-        ("MethodCalls", ["edge_id", "caller_method", "callee_method", "callee_name"], call_rows),
-        ("FileDefinesClass", ["edge_id", "file_id", "class_id"], fdc_rows),
-        ("ClassDefinesMethod", ["edge_id", "class_id", "method_id"], cdm_rows),
-        ("FileBelongsToModule", ["edge_id", "file_id", "module_id"], fbm_rows),
-        ("DirContainsFile", ["edge_id", "dir_id", "file_id"], dcf_rows),
-    ]
+    edge_writes = [(table, EDGE_COLUMNS[table], derived["rows"][table])
+                   for table in EDGE_COLUMNS]
 
     def _write_edge(args):
         table, columns, rows = args
@@ -1997,13 +2292,15 @@ def phase9_write_edges(data: PipelineData):
             _batch_insert(db, table, columns, rows)
             _print(f"  [Phase 9] Wrote {len(rows)} {table} edges")
 
-    with ThreadPoolExecutor(max_workers=7) as pool:
+    with ThreadPoolExecutor(max_workers=len(edge_writes)) as pool:
         list(pool.map(_write_edge, edge_writes))
 
+    counts = {t: len(derived["rows"][t]) for t in EDGE_COLUMNS if derived["rows"][t]}
     elapsed = time.time() - t0
     data.timings["phase9_write_edges"] = elapsed
     total_edges = sum(counts.values())
     _print(f"[Phase 9] Wrote {total_edges} edges in {elapsed:.1f}s: {counts}")
+    _print(f"  [Phase 9] Resolution stats: {derived['stats']}")
 
 
 # ===================================================================
@@ -2093,6 +2390,8 @@ def phase10_generate_embeddings(data: PipelineData):
     # -- Class embeddings --
     class_items = []
     for fp, ent in data.extracted_entities.items():
+        if not _is_app_file(data, fp):
+            continue  # vendor classes get nodes but no embeddings (cost)
         file_summary = data.file_summaries.get(fp, "")
         for cls in ent.get("classes", []):
             cname = cls.get("name", "")
@@ -2128,7 +2427,7 @@ def phase10_generate_embeddings(data: PipelineData):
 # ===================================================================
 
 
-async def run_docs_pipeline(target_dir: str) -> PipelineData:
+async def run_docs_pipeline(target_dir: str, include_vendor: bool = False) -> PipelineData:
     """Run documentation generation pipeline (Phases 1-6)."""
     client = genai.Client(
         vertexai=True,
@@ -2136,6 +2435,7 @@ async def run_docs_pipeline(target_dir: str) -> PipelineData:
         location=config.GCP_REGION,
     )
     data = PipelineData(target_dir=os.path.abspath(target_dir))
+    data.include_vendor = include_vendor
 
     phase1_scan(data)
     phase1b_treesitter_entities(data)
@@ -2150,8 +2450,69 @@ async def run_docs_pipeline(target_dir: str) -> PipelineData:
     return data
 
 
+def phase1c_lsp_resolution(data: PipelineData):
+    """Phase 1.6: semantic resolution (Intelephense LSP + CakePHP conventions).
+
+    Local, no GCP. Checkpoints to resolutions.json with per-file mtime resume;
+    degrades loudly to convention/parser-only resolution when Intelephense is
+    unavailable (unconfirmed calls become PossiblyCalls, never MethodCalls).
+    """
+    from .resolution import run_resolution
+
+    t0 = time.time()
+    stats = run_resolution(data, printer=_print)
+    elapsed = time.time() - t0
+    data.timings["phase1c_lsp_resolution"] = elapsed
+    summary = {k: v for k, v in stats.items() if k not in ("engine",)}
+    _print(f"[Phase 1.6] Resolution ({stats.get('engine', '?')}): "
+           f"{summary} in {_fmt_elapsed(elapsed)}")
+
+
+def phase1d_db_schema(data: PipelineData):
+    """Phase 1.7: build the DB schema from CakePHP/Phinx migrations (local).
+
+    Deterministically replays migration files detected via
+    config.DB_SCHEMA_DETECTORS into a final schema (tables/columns/indexes/
+    foreign keys), feeding DbTables nodes + TableReferences/ClassMapsToTable
+    edges. Independent of the Gemini ER docs in phase_schema_docs.
+    """
+    from .migration_parser import build_schema
+
+    t0 = time.time()
+    mig_files = []
+    for fp in data.file_list:
+        norm = fp.replace(os.sep, "/")
+        for det in config.DB_SCHEMA_DETECTORS:
+            if any(tok in norm for tok in det.get("dir_tokens", ())):
+                mig_files.append(fp)
+                break
+
+    if not mig_files:
+        data.db_schema = {"tables": {}, "warnings": []}
+        data.timings["phase1d_db_schema"] = time.time() - t0
+        _print("[Phase 1.7] No migration files found — no DB schema tables")
+        return
+
+    mig_files.sort(key=lambda p: os.path.basename(p))
+    files = [(os.path.relpath(fp, data.target_dir), _read_source_file(fp))
+             for fp in mig_files]
+    data.db_schema = build_schema(files)
+    elapsed = time.time() - t0
+    data.timings["phase1d_db_schema"] = elapsed
+    n_tables = len(data.db_schema.get("tables", {}))
+    warns = data.db_schema.get("warnings", [])
+    _print(f"[Phase 1.7] DB schema: {n_tables} tables from {len(mig_files)} "
+           f"migrations in {_fmt_elapsed(elapsed)}"
+           + (f" ({len(warns)} warnings)" if warns else ""))
+
+
 def run_graph_pipeline(data: PipelineData):
     """Run Spanner graph generation pipeline (Phases 8-10) with checkpointing."""
+    # Phases 1.6/1.7 run at the start of the graph track (never in the wiki
+    # track): resolution + DB schema feed Phase 8/9 derivation.
+    phase1c_lsp_resolution(data)
+    phase1d_db_schema(data)
+
     last_phase = _load_graph_checkpoint(data)
 
     if last_phase not in ("phase8", "phase9", "phase10"):
@@ -2173,8 +2534,8 @@ def run_graph_pipeline(data: PipelineData):
         _print(f"[Resume] Skipping Phase 10 (already completed)")
 
 
-async def run_pipeline(target_dir: str) -> PipelineData:
+async def run_pipeline(target_dir: str, include_vendor: bool = False) -> PipelineData:
     """Run full pipeline: docs + graph (Phases 1-10)."""
-    data = await run_docs_pipeline(target_dir)
+    data = await run_docs_pipeline(target_dir, include_vendor=include_vendor)
     run_graph_pipeline(data)
     return data
