@@ -1,0 +1,73 @@
+{
+  "fixture": "multi_repo",
+  "description": "Three interdependent PHP repos (a shared domain library and two services that consume it) used to verify cross-repository dependency, DI wiring & coupling analysis (`crossref`). Framework-free so it runs with no composer/vendor.",
+  "generated": "2026-07-11",
+  "repos": [
+    {"name": "shared", "path": "shared", "role": "domain library (Shared\\*), incl. namespaced function Shared\\Util\\money_round"},
+    {"name": "web", "path": "web", "role": "service, depends on shared (Web\\*), incl. classless bootstrap.php"},
+    {"name": "api", "path": "api", "role": "service, depends on shared (Api\\*)"}
+  ],
+  "conventions": {
+    "cross_repo_refs": "expected CrossRepoRef edges (Class -> Class in another repo), deduped by (source_repo, target_repo, target_fqcn, kind). kind: import (use statement, attributed to the classes that mention the alias) | class_ref (::class literal / callable string) | extends / implements / uses (heritage) | new (instantiation) | type_hint (parameter or return type) | instanceof.",
+    "cross_repo_file_refs": "expected CrossRepoFileRef edges (File -> Class in another repo) for files that define NO classes (bootstrap/config wiring); same kinds as cross_repo_refs, deduped by (source_repo, target_repo, target_fqcn, kind).",
+    "cross_repo_calls": "expected CrossRepoCalls edges (Method -> Method in another repo), by (source_repo, target_repo, target_fqmn). Receiver types come from typed parameters, constructor-injected (promoted) properties, and chained receivers whose type is recovered from an earlier resolved call's declared return type. Plain namespaced-function calls also land here ((global) pseudo-class endpoints).",
+    "cross_repo_binds": "expected DiBinds edges from `services()` `add(Interface::class, Concrete::class)` — (source_repo=interface's repo, target_repo=concrete's repo, symbol=concrete fqcn).",
+    "cross_repo_injects": "expected DiInjects edges from `services()` `add(Service::class)->addArgument(Dep::class)` — (source_repo=service's repo, target_repo=dep's repo, symbol=dep fqcn).",
+    "coupling": "expected repo->repo counts: refs=CrossRepoRef+CrossRepoFileRef, calls=CrossRepoCalls, di=DiBinds+DiInjects.",
+    "expected_drops": "everything the derivation must refuse to edge AND must report: `ambiguous` (fqcn -> repos defining it) and `unowned_sample` (referenced FQCNs owned by no ingested repo).",
+    "exactness": "the derivation must produce EXACTLY these edges — no more (negative controls below must NOT appear)."
+  },
+  "cross_repo_refs": [
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "import", "from": "Web\\Order\\OrderService"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "class_ref", "from": "Web\\Order\\OrderService::priceClass (Price::class)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "type_hint", "from": "Web\\Order\\OrderService::total(Price $base, Price $tax) and Web\\Money\\Cart::zero(): Price"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Logging\\Logger", "kind": "import", "from": "Web\\Order\\OrderService"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Logging\\Logger", "kind": "type_hint", "from": "Web\\Order\\OrderService::__construct(private Logger $logger)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Contracts\\Clock", "kind": "import", "from": "Web\\Time\\SystemClock"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Contracts\\Clock", "kind": "implements", "from": "Web\\Time\\SystemClock (via use alias) and Web\\Time\\FrozenClock (inline FQCN, no import)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "new", "from": "Web\\Money\\Cart::zero (new \\Shared\\Money\\Price)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "instanceof", "from": "Web\\Money\\Cart::isPrice"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Contracts\\Clock", "kind": "class_ref", "from": "Web\\Application (services wiring, \\Shared\\Contracts\\Clock::class)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Logging\\Logger", "kind": "class_ref", "from": "Web\\Application (services wiring, \\Shared\\Logging\\Logger::class)"},
+    {"source_repo": "api", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "import", "from": "Api\\Billing\\InvoiceService"},
+    {"source_repo": "api", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "type_hint", "from": "Api\\Billing\\InvoiceService::charge(Price $amount)"},
+    {"source_repo": "api", "target_repo": "shared", "target_fqcn": "Shared\\Logging\\Logger", "kind": "import", "from": "Api\\Billing\\InvoiceService"},
+    {"source_repo": "api", "target_repo": "shared", "target_fqcn": "Shared\\Logging\\Logger", "kind": "type_hint", "from": "Api\\Billing\\InvoiceService::__construct(private Logger $logger)"}
+  ],
+  "cross_repo_refs_note": "Exact-set tests key on (source_repo, target_repo, target_fqcn, kind); distinct source classes yield distinct rows, so (Price, type_hint) covers OrderService AND Cart, and (Clock, implements) covers SystemClock AND FrozenClock — 13 web + 4 api = 17 CrossRepoRef rows total.",
+  "cross_repo_ref_row_count": 17,
+  "cross_repo_file_refs": [
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "import", "from": "web/bootstrap.php (use Shared\\Money\\Price)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "new", "from": "web/bootstrap.php web_boot() (new Price)"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqcn": "Shared\\Money\\Price", "kind": "type_hint", "from": "web/bootstrap.php web_boot(): Price return type"}
+  ],
+  "cross_repo_calls": [
+    {"source_repo": "web", "target_repo": "shared", "target_fqmn": "Shared\\Money\\Price::add", "why": "typed Price parameter $base"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqmn": "Shared\\Money\\Price::amount", "why": "chained receiver: $sum = $base->add($tax) types $sum as Price via add()'s declared return type"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqmn": "Shared\\Logging\\Logger::info", "why": "constructor-injected $this->logger"},
+    {"source_repo": "web", "target_repo": "shared", "target_fqmn": "Shared\\Util\\money_round", "why": "namespaced function called by FQCN from web/bootstrap.php web_boot()"},
+    {"source_repo": "api", "target_repo": "shared", "target_fqmn": "Shared\\Money\\Price::format", "why": "typed Price parameter $amount"},
+    {"source_repo": "api", "target_repo": "shared", "target_fqmn": "Shared\\Logging\\Logger::info", "why": "constructor-injected $this->logger"}
+  ],
+  "cross_repo_binds": [
+    {"source_repo": "shared", "target_repo": "web", "source_fqcn": "Shared\\Contracts\\Clock", "target_fqcn": "Web\\Time\\SystemClock", "why": "Web\\Application::services() binds Clock interface to SystemClock via add(Clock::class, SystemClock::class)"}
+  ],
+  "cross_repo_injects": [
+    {"source_repo": "web", "target_repo": "shared", "source_fqcn": "Web\\Order\\OrderService", "target_fqcn": "Shared\\Logging\\Logger", "why": "Web\\Application::services() injects the shared Logger into OrderService via addArgument(Logger::class)"}
+  ],
+  "coupling": {
+    "web->shared": {"refs": 16, "calls": 4, "di": 1},
+    "shared->web": {"refs": 0, "calls": 0, "di": 1},
+    "api->shared": {"refs": 4, "calls": 2, "di": 0}
+  },
+  "expected_drops": {
+    "ambiguous": {},
+    "unowned_sample": ["Cake\\Core\\ContainerInterface"]
+  },
+  "negative_controls": [
+    {"type": "same_simple_name_not_merged", "detail": "Web\\Support\\Logger shares the simple name 'Logger' with Shared\\Logging\\Logger. Web\\Support\\LocalReporter uses the LOCAL one (unqualified name in the same namespace — PHP class names never fall back to other namespaces), so it must NOT produce any cross-repo edge to shared."},
+    {"type": "dynamic_receiver_skipped", "detail": "Web\\Order\\DynamicDispatcher::run calls $handler->handle() on a runtime-computed receiver; no cross-repo edge (documented method-level boundary)."},
+    {"type": "unowned_vendor_type_reported_not_edged", "detail": "Web\\Application type-hints Cake\\Core\\ContainerInterface, which no ingested repo owns — it must appear in drops.unowned_sample and never as an edge."},
+    {"type": "chained_receiver_without_return_type", "detail": "Chained receivers are only typed through methods with DECLARED return types; a chain through an untyped method stays uncaptured (remaining honest boundary — Price::add declares `: Price`, which is why Price::amount IS captured above)."}
+  ]
+}

@@ -6,6 +6,7 @@ Two PHP codebases purpose-built to test resolution that **syntax-only parsing ca
 |---|---|---|---|
 | `php_plain/` | Framework-free composer-style project; hand-authored `vendor/` with two packages that deliberately share class+method names | 49 | fully |
 | `php_cakephp/` | Real CakePHP **5.3.6** app (`composer create-project cakephp/app:~5.3`) + two local plugins with colliding `Service\Gateway::charge()` + app classes shadowing real vendor classes + Phinx migrations | 41 | app code + lock; `vendor/`, `tmp/`, `logs/` stay local |
+| `multi_repo/` | Three interdependent framework-free repos (a shared library `shared/` + two services `web/` `api/` that consume it) for verifying **cross-repository** dependency & coupling (`crossref`) — every ref kind (import / class_ref / heritage / new / type_hint / instanceof), classless-file refs, chained receivers, namespaced function calls, DI, plus same-name-no-merge / dynamic / unowned-reported negative controls. Ground truth in `cross_ground_truth.json`; verified by `tests/test_multi_repo_fixture.py` + `tests/test_crossref_accuracy.py`. | 20 refs / 6 calls / 2 di | fully |
 
 ## Ground truth
 

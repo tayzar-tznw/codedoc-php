@@ -34,6 +34,7 @@ test_codes/*
 !test_codes/validate_ground_truth.py
 !test_codes/php_plain/
 !test_codes/php_cakephp/
+!test_codes/multi_repo/
 test_codes/php_cakephp/vendor/
 test_codes/php_cakephp/tmp/
 test_codes/php_cakephp/logs/

@@ -569,6 +569,7 @@ def _save_graph_checkpoint(data: PipelineData, phase: str):
         "method_id_map": data.method_id_map,
         "module_id_map": data.module_id_map,
         "dir_id_map": data.dir_id_map,
+        "dbtable_id_map": data.dbtable_id_map,
     }
     with open(cp_path, "w", encoding="utf-8") as f:
         json.dump(cp, f)
@@ -598,6 +599,7 @@ def _load_graph_checkpoint(data: PipelineData) -> str | None:
         data.method_id_map = cp.get("method_id_map", {})
         data.module_id_map = cp.get("module_id_map", {})
         data.dir_id_map = cp.get("dir_id_map", {})
+        data.dbtable_id_map = cp.get("dbtable_id_map", {})
         phase = cp.get("completed_phase", "")
         total_ids = (len(data.file_id_map) + len(data.class_id_map) +
                      len(data.method_id_map) + len(data.module_id_map) + len(data.dir_id_map))
@@ -733,6 +735,7 @@ def phase1b_treesitter_entities(data: PipelineData):
     Skips files that already have entities (resume support).
     """
     from .treesitter_parser import parse_entities
+    from .di_parser import extract_di_bindings
 
     t0 = time.time()
     total = len(data.file_list)
@@ -755,6 +758,9 @@ def phase1b_treesitter_entities(data: PipelineData):
                 continue
             entities = parse_entities(fp, content)
             if entities:
+                # DI container wiring (services() bindings) rides on the entity
+                # so both the per-repo pass and crossref can consume it.
+                entities["di_bindings"] = extract_di_bindings(fp, content)
                 data.extracted_entities[fp] = entities
                 parsed += 1
             else:
@@ -1913,9 +1919,27 @@ def phase8_write_nodes(data: PipelineData):
     data.dir_id_map = built["dir_id_map"]
     data.dbtable_id_map = built["dbtable_id_map"]
 
+    _write_graph_meta(data)  # lets `crossref` recompute this repo's node IDs
+
     elapsed = time.time() - t0
     data.timings["phase8_write_nodes"] = elapsed
     _print(f"[Phase 8] Wrote nodes in {elapsed:.1f}s: {counts}")
+
+
+def _write_graph_meta(data: PipelineData):
+    """Persist the repo→target_dir mapping (+ ID scheme) so the cross-repo
+    `crossref` step can reconstruct this repo's deterministic node IDs from its
+    committed entities.json without re-scanning."""
+    out_root = os.path.join(os.getcwd(), config.OUTPUT_DIR)
+    os.makedirs(out_root, exist_ok=True)
+    meta = {
+        "repo": data.repo,
+        "target_dir": data.target_dir,
+        "id_scheme": ID_SCHEME,
+        "id_prefix": config.ID_PREFIX,
+    }
+    with open(os.path.join(out_root, "graph_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f)
 
 
 # ===================================================================
@@ -1927,7 +1951,7 @@ EDGE_COLUMNS = {t: _write_columns(t) for t in (
     "FileImports", "FileDependsOn", "ClassInherits", "MethodCalls",
     "PossiblyCalls", "FileDefinesClass", "ClassDefinesMethod",
     "FileBelongsToModule", "DirContainsFile", "TableReferences",
-    "ClassMapsToTable")}
+    "ClassMapsToTable", "DiBinds", "DiInjects")}
 
 
 def derive_edge_rows(data: PipelineData) -> dict[str, Any]:
@@ -2276,6 +2300,49 @@ def derive_edge_rows(data: PipelineData) -> dict[str, Any]:
             if tid:
                 rows["ClassMapsToTable"].append(
                     [_make_id("c2t", cid, tid), cid, tid, via])
+
+    # ── DI wiring edges (within-repo) ────────────────────────────
+    # Emit DiBinds (interface→concrete) / DiInjects (consumer→dependency) when
+    # BOTH endpoints are classes in THIS repo. Cross-repo bindings (target in
+    # another repo) are left to `crossref`.
+    from .resolution import FileCtx
+    class_id_by_fqcn: dict[str, str] = {}
+    for fp, ent in data.extracted_entities.items():
+        for cls in ent.get("classes", []):
+            fq = cls.get("fqcn") or ""
+            cid = data.class_id_map.get(f"{fp}|{cls.get('name', '')}", "")
+            if fq and cid:
+                class_id_by_fqcn[fq.lower()] = cid
+
+    def _resolve_class_id(ctx: FileCtx, text: str) -> str:
+        for cand in ctx.candidates(text):
+            cid = class_id_by_fqcn.get(cand.lower())
+            if cid:
+                return cid
+        return ""
+
+    _di_tables = {"bind": "DiBinds", "inject": "DiInjects"}
+    _di_seen: set[tuple[str, str, str]] = set()
+    for fp, ent in data.extracted_entities.items():
+        bindings = ent.get("di_bindings") or []
+        if not bindings:
+            continue
+        ctx = FileCtx(ent)
+        for b in bindings:
+            table = _di_tables.get(b.get("kind", ""))
+            if table is None:
+                continue
+            src_cid = _resolve_class_id(ctx, b.get("source", ""))
+            tgt_cid = _resolve_class_id(ctx, b.get("target", ""))
+            if not src_cid or not tgt_cid or src_cid == tgt_cid:
+                continue  # cross-repo target (not internal) or unresolved → skip
+            key = (table, src_cid, tgt_cid)
+            if key in _di_seen:
+                continue
+            _di_seen.add(key)
+            eid = _make_id(b["kind"], src_cid, tgt_cid)
+            rows[table].append([eid, src_cid, tgt_cid, data.repo, data.repo,
+                                b.get("target", "")])
 
     return {"rows": rows, "stats": stats}
 

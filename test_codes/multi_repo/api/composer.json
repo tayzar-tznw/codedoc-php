@@ -1,0 +1,13 @@
+{
+    "name": "acme/api",
+    "description": "API service. Depends on acme/shared.",
+    "type": "project",
+    "require": {
+        "acme/shared": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Api\\": "src/"
+        }
+    }
+}

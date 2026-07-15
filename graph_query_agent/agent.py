@@ -115,6 +115,15 @@ GQLクエリは必ず `GRAPH {GRAPH_NAME}` で始めてください。
 - DirContainsFile: (dir_id) → (file_id)
 - TableReferences: (source_table) → (target_table)  ※ 外部キー(fk_column, referenced_column)
 - ClassMapsToTable: (class_id) → (table_id)  ※ CakePHP Table クラス→DBテーブル(via = settable|convention)
+- CrossRepoRef: (source_class) → (target_class)  ※ リポジトリ間のクラス参照(source_repo→target_repo, symbol=FQCN, kind=import|class_ref|extends|implements|uses|new|type_hint|instanceof)
+- CrossRepoFileRef: (source_file) → (target_class)  ※ クラスを定義しないファイル(bootstrap/設定)からのリポジトリ間クラス参照(kind は CrossRepoRef と同じ)
+- CrossRepoCalls: (caller_method) → (callee_method)  ※ リポジトリ間のメソッド呼び出し・名前空間関数呼び出し(source_repo→target_repo, symbol=FQMN)
+- DiBinds: (source_class) → (target_class)  ※ DI コンテナのインターフェース→具象クラス束縛(source=interface, target=concrete, source_repo/target_repo)
+- DiInjects: (source_class) → (target_class)  ※ DI コンテナのサービス→依存注入(source=consumer, target=dependency, source_repo/target_repo)
+
+CrossRepoRef / CrossRepoFileRef / CrossRepoCalls は**別リポジトリ間の依存**を表す唯一のエッジです
+(同一リポジトリ内は MethodCalls/ClassInherits など)。「repo A を変更したら repo B に影響するか
+(影響分析)」「repo 間の結合度」はこれらで答えます。
 
 確定した呼び出しは MethodCalls、未確定は PossiblyCalls です。厳密な呼び出し関係が
 必要なときは MethodCalls を、可能性を広く見たいときは PossiblyCalls も併用してください。
@@ -150,6 +159,35 @@ GRAPH {GRAPH_NAME}
 MATCH (m:Methods)
 WHERE m.name = 'save'
 RETURN m.repo, m.fqmn
+
+### 影響分析: あるクラスを変更したら、他リポジトリのどこに影響するか:
+GRAPH {GRAPH_NAME}
+MATCH (src:Classes)-[r:CrossRepoRef]->(tgt:Classes)
+WHERE tgt.fqcn = 'Shared\\Money\\Price'
+RETURN DISTINCT src.repo, src.fqcn, r.kind
+
+### 影響分析(メソッド単位): あるメソッドを変更したら、他リポジトリのどの呼び出し元が影響するか:
+GRAPH {GRAPH_NAME}
+MATCH (caller:Methods)-[c:CrossRepoCalls]->(callee:Methods)
+WHERE callee.fqmn = 'Shared\\Money\\Price::add'
+RETURN caller.repo, caller.fqmn
+
+### リポジトリ間の結合度(参照本数):
+GRAPH {GRAPH_NAME}
+MATCH (s:Classes)-[r:CrossRepoRef]->(t:Classes)
+RETURN r.source_repo, r.target_repo, COUNT(*) AS coupling
+
+### DI 影響分析: この依存(D)を変更したら、注入されている側(サービス)はどこか:
+GRAPH {GRAPH_NAME}
+MATCH (s:Classes)-[i:DiInjects]->(d:Classes)
+WHERE d.fqcn = 'Shared\\Logging\\Logger'
+RETURN s.repo, s.fqcn
+
+### DI: あるインターフェースを実装している具象クラスはどれか(束縛):
+GRAPH {GRAPH_NAME}
+MATCH (iface:Classes)-[b:DiBinds]->(impl:Classes)
+WHERE iface.fqcn = 'Shared\\Contracts\\Clock'
+RETURN impl.repo, impl.fqcn
 
 日本語で回答してください。""",
     tools=[run_gql_query],

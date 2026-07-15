@@ -1,0 +1,13 @@
+{
+    "name": "acme/shared",
+    "description": "Shared domain library used by the web and api services.",
+    "type": "library",
+    "autoload": {
+        "psr-4": {
+            "Shared\\": "src/"
+        },
+        "files": [
+            "src/functions.php"
+        ]
+    }
+}

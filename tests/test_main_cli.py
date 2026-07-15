@@ -75,6 +75,7 @@ def test_cmd_validate_with_fake_db(monkeypatch, capsys):
     # GROUP BY repo marker must precede the plain COUNT(*) marker (the group
     # query contains both substrings; first match wins).
     db = FakeSpannerDb(sql_rows={
+        "GROUP BY source_repo": [["web", "shared", 4]],  # cross-repo coupling
         "GROUP BY repo": [["web", 10], ["api", 7]],
         "COUNT(*)": [[3]],
     })
@@ -86,6 +87,8 @@ def test_cmd_validate_with_fake_db(monkeypatch, capsys):
     assert "Orphan checks" in out
     assert "Nodes by repo" in out
     assert "web=10" in out and "api=7" in out
+    assert "Cross-repo coupling" in out
+    assert "web → shared" in out
 
 
 def test_load_pipeline_data_backfills_missing_fields(tmp_path, monkeypatch):

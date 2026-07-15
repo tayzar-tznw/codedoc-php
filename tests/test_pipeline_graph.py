@@ -174,12 +174,26 @@ def test_checkpoint_roundtrip_and_id_scheme(tmp_path, out_dir):
     for k in ("file_id_map", "class_id_map", "method_id_map",
               "module_id_map", "dir_id_map"):
         setattr(data, k, built[k])
+    # dbtable_id_map comes from the migration phase, not build_node_rows —
+    # it must survive the roundtrip too (TableReferences/ClassMapsToTable
+    # derivation on resume depends on it).
+    data.dbtable_id_map = {"users": "tbl_users_x"}
     _save_graph_checkpoint(data, "phase8")
 
     fresh = PipelineData(target_dir=data.target_dir)
     phase = _load_graph_checkpoint(fresh)
     assert phase == "phase8"
     assert fresh.file_id_map == data.file_id_map
+    assert fresh.dbtable_id_map == {"users": "tbl_users_x"}
+
+    # A pre-dbtable checkpoint (no key) loads with an empty map, not a crash
+    cp_path = os.path.join(out_dir, "graph_checkpoint.json")
+    cp = json.load(open(cp_path))
+    del cp["dbtable_id_map"]
+    json.dump(cp, open(cp_path, "w"))
+    old = PipelineData(target_dir=data.target_dir)
+    assert _load_graph_checkpoint(old) == "phase8"
+    assert old.dbtable_id_map == {}
 
     # An old-scheme checkpoint is rejected (returns None → rebuild from Phase 8)
     cp_path = os.path.join(out_dir, "graph_checkpoint.json")

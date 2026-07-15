@@ -265,6 +265,31 @@ class FileCtx:
             elif u.get("kind") == "class":
                 self.aliases[_norm(u["alias"])] = u["fqcn"]
 
+    def resolve_class_strict(self, text: str) -> str:
+        """The single FQCN a class reference denotes, per PHP semantics.
+
+        Unlike candidates(), this never falls back to the global namespace:
+        PHP class names (unlike functions/constants) resolve to exactly one
+        FQCN at compile time — leading `\\` is absolute, `namespace\\X` is
+        current-namespace-relative, an aliased first segment expands, and
+        anything else is prefixed with the current namespace. Use this where
+        emitting the WRONG class would create a wrong edge; use candidates()
+        only as an ordered existence probe.
+        """
+        text = text.strip()
+        if not text:
+            return ""
+        if text.startswith("\\"):
+            return text.lstrip("\\")
+        if text.lower().startswith("namespace\\"):
+            rest = text[len("namespace\\"):]
+            return f"{self.namespace}\\{rest}" if self.namespace else rest
+        head, sep, rest = text.partition("\\")
+        alias = self.aliases.get(_norm(head))
+        if alias:
+            return f"{alias}\\{rest}" if sep else alias
+        return f"{self.namespace}\\{text}" if self.namespace else text
+
     def candidates(self, text: str) -> list[str]:
         """Possible FQCNs for a (possibly qualified) class reference."""
         text = text.strip()

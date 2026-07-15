@@ -5,11 +5,13 @@ templates) with exact same output schema as the LLM entity extraction prompt.
 Returns None for unsupported extensions or unparseable files — the caller then
 skips entity extraction for that file (chunking falls back to character-based).
 
-Schema v2 (ENTITIES_VERSION = 2) adds resolution inputs on top of the v1
-fields, all additive: per-class `fqcn`/`start_line`/`end_line`/`heritage`,
-per-member `member_kind`/`start_line`/`end_line`, per-method `param_types`/
-`call_sites`/`prop_sites`/`class_refs`/`assignments`, and file-level
-structured `uses`. Positions are 1-based lines and 0-based UTF-16 code-unit
+Schema v2 added resolution inputs on top of the v1 fields, all additive:
+per-class `fqcn`/`start_line`/`end_line`/`heritage`, per-member
+`member_kind`/`start_line`/`end_line`, per-method `param_types`/`call_sites`/
+`prop_sites`/`class_refs`/`assignments`, and file-level structured `uses`.
+v3 adds a file-level `di_bindings` list (DI container wiring), attached by
+Phase 1.5 via di_parser — hence the version bump even though parse_entities
+itself is unchanged. Positions are 1-based lines and 0-based UTF-16 code-unit
 columns (the LSP wire format — tree-sitter's byte columns shift on lines
 containing multibyte text, so the conversion happens here, once).
 """
@@ -24,7 +26,7 @@ import tree_sitter as ts
 # Version of the entity dict schema produced by parse_entities. Bump when
 # fields change shape; entities.json checkpoints with a different version are
 # discarded and re-parsed.
-ENTITIES_VERSION = 2
+ENTITIES_VERSION = 3
 
 # Lazy-loaded language objects
 _languages: dict[str, ts.Language] = {}
@@ -316,6 +318,24 @@ def _extract_member_data(body_node: ts.Node | None, source: bytes) -> dict[str, 
                     "line": _line(named[0]),
                     "col": _utf16_col(named[0], source),
                 })
+
+        elif t == "binary_expression":
+            # `$x instanceof Foo` — the right operand is a class reference.
+            # Only name nodes AFTER the instanceof token count (the left
+            # operand may itself parse as a bare `name`, e.g. a constant).
+            kids = node.children
+            for i, c in enumerate(kids):
+                if c.type == "instanceof":
+                    for rc in kids[i + 1:]:
+                        if rc.type in _PHP_NAME_NODES:
+                            class_refs.append({
+                                "text": _node_text(rc),
+                                "kind": "instanceof",
+                                "line": _line(rc),
+                                "col": _utf16_col(rc, source),
+                            })
+                            break
+                    break
 
         elif t in ("string", "encapsed_string"):
             # Standalone 'FQCN::method' callable strings (array elements,

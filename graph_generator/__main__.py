@@ -418,6 +418,17 @@ def cmd_setup_spanner(args):
     print("\nSpanner setup complete.")
 
 
+def cmd_crossref(args):
+    """Derive + write cross-repo dependency edges and print the coupling matrix."""
+    _check_config()
+    from .crossref import run_crossref
+    print("=" * 70)
+    print("  CodeDoc — Cross-Repository Analysis")
+    print("=" * 70)
+    run_crossref(printer=print, write=not getattr(args, "dry_run", False))
+    print("=" * 70)
+
+
 def cmd_evaluate(args):
     """Evaluate the extractor + resolver against the committed fixtures."""
     from .evaluate import run_evaluation
@@ -497,6 +508,31 @@ def cmd_validate(args):
             WHERE NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.class_id)
                OR NOT EXISTS (SELECT 1 FROM DbTables t WHERE t.table_id = e.table_id)
         """),
+        ("CrossRepoRef → Classes", """
+            SELECT COUNT(*) FROM CrossRepoRef e
+            WHERE NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.source_class)
+               OR NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.target_class)
+        """),
+        ("CrossRepoFileRef → nodes", """
+            SELECT COUNT(*) FROM CrossRepoFileRef e
+            WHERE NOT EXISTS (SELECT 1 FROM Files f WHERE f.file_id = e.source_file)
+               OR NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.target_class)
+        """),
+        ("CrossRepoCalls → Methods", """
+            SELECT COUNT(*) FROM CrossRepoCalls e
+            WHERE NOT EXISTS (SELECT 1 FROM Methods m WHERE m.method_id = e.caller_method)
+               OR NOT EXISTS (SELECT 1 FROM Methods m WHERE m.method_id = e.callee_method)
+        """),
+        ("DiBinds → Classes", """
+            SELECT COUNT(*) FROM DiBinds e
+            WHERE NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.source_class)
+               OR NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.target_class)
+        """),
+        ("DiInjects → Classes", """
+            SELECT COUNT(*) FROM DiInjects e
+            WHERE NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.source_class)
+               OR NOT EXISTS (SELECT 1 FROM Classes c WHERE c.class_id = e.target_class)
+        """),
     ]
     for label, query in orphan_queries:
         with db.snapshot() as snap:
@@ -504,6 +540,27 @@ def cmd_validate(args):
             count = rows[0][0] if rows else 0
             status = "OK" if count == 0 else f"WARNING: {count} orphans"
             print(f"  {label:<35} {status}")
+
+    # Cross-repo coupling matrix (source_repo → target_repo : ref/call/di counts)
+    print("\n  Cross-repo coupling:")
+    coupling: dict[tuple, dict] = {}
+    for tbl, key in (("CrossRepoRef", "refs"), ("CrossRepoFileRef", "refs"),
+                     ("CrossRepoCalls", "calls"),
+                     ("DiBinds", "di"), ("DiInjects", "di")):
+        with db.snapshot() as snap:
+            for row in snap.execute_sql(
+                    f"SELECT source_repo, target_repo, COUNT(*) FROM {tbl} "
+                    "GROUP BY source_repo, target_repo"):
+                if len(row) >= 3:
+                    c = coupling.setdefault((row[0], row[1]),
+                                            {"refs": 0, "calls": 0, "di": 0})
+                    c[key] = c.get(key, 0) + row[2]  # DiBinds+DiInjects both → di
+    if coupling:
+        for (src, tgt) in sorted(coupling):
+            c = coupling[(src, tgt)]
+            print(f"    {src} → {tgt} :  {c['refs']} refs / {c['calls']} calls / {c['di']} di")
+    else:
+        print("    (none — run `crossref` after ingesting 2+ repos)")
 
     print("=" * 70)
 
@@ -566,6 +623,12 @@ def main():
     # validate
     subparsers.add_parser("validate", help="Validate Spanner graph data")
 
+    # crossref — cross-repository dependency + coupling analysis
+    p_xr = subparsers.add_parser(
+        "crossref", help="Analyze cross-repo dependencies + coupling (run after ingesting repos)")
+    p_xr.add_argument("--dry-run", action="store_true",
+                      help="Derive + print the coupling matrix without writing edges")
+
     # --- evaluate (local, no GCP) ---
     p_eval = subparsers.add_parser(
         "evaluate", help="Evaluate extractor+resolver against test_codes/ fixtures (local, no GCP)")
@@ -604,6 +667,8 @@ def main():
             p_up.print_help()
     elif args.command == "evaluate":
         cmd_evaluate(args)
+    elif args.command == "crossref":
+        cmd_crossref(args)
     elif args.command == "validate":
         cmd_validate(args)
 

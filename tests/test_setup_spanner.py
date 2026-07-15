@@ -21,7 +21,7 @@ def test_node_and_edge_ddl_cover_all_tables():
     node_ddl = s.node_table_ddl()
     edge_ddl = s.edge_table_ddl()
     assert len(node_ddl) == len(s.NODE_TABLES) == 6
-    assert len(edge_ddl) == len(s.EDGE_TABLES) == 11
+    assert len(edge_ddl) == len(s.EDGE_TABLES) == 16
     joined = "\n".join(node_ddl + edge_ddl)
     for t in s.NODE_TABLES + s.EDGE_TABLES:
         assert f"CREATE TABLE {t} " in joined

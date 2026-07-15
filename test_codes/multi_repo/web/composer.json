@@ -1,0 +1,13 @@
+{
+    "name": "acme/web",
+    "description": "Web service. Depends on acme/shared.",
+    "type": "project",
+    "require": {
+        "acme/shared": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "Web\\": "src/"
+        }
+    }
+}

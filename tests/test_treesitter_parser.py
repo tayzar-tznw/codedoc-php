@@ -16,8 +16,8 @@ def _first_method(ent, class_name, method_name):
     raise AssertionError(f"{class_name}::{method_name} not found")
 
 
-def test_entities_version_is_2():
-    assert ENTITIES_VERSION == 2
+def test_entities_version_is_3():
+    assert ENTITIES_VERSION == 3
 
 
 def test_unsupported_extension_returns_none():

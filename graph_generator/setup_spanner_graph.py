@@ -121,6 +121,35 @@ EDGE_SPEC: dict[str, tuple[str, list[tuple[str, str]], tuple[str, str], tuple[st
         ("edge_id", "str"), ("class_id", "str"), ("table_id", "str"),
         ("via", "str"),
     ], ("class_id", "Classes"), ("table_id", "DbTables")),
+    # Cross-repo dependency layer (populated by `crossref`, not the per-repo
+    # graph track). Endpoints are nodes in DIFFERENT repos.
+    "CrossRepoRef": ("edge_id", [
+        ("edge_id", "str"), ("source_class", "str"), ("target_class", "str"),
+        ("source_repo", "str"), ("target_repo", "str"), ("symbol", "str"),
+        ("kind", "str"),
+    ], ("source_class", "Classes"), ("target_class", "Classes")),
+    "CrossRepoCalls": ("edge_id", [
+        ("edge_id", "str"), ("caller_method", "str"), ("callee_method", "str"),
+        ("source_repo", "str"), ("target_repo", "str"), ("symbol", "str"),
+    ], ("caller_method", "Methods"), ("callee_method", "Methods")),
+    # DI container wiring (from `services()` definitions). Within-repo edges are
+    # written by Phase 9; cross-repo ones by `crossref`. repo columns let a
+    # query tell the two apart without a join.
+    "DiBinds": ("edge_id", [
+        ("edge_id", "str"), ("source_class", "str"), ("target_class", "str"),
+        ("source_repo", "str"), ("target_repo", "str"), ("symbol", "str"),
+    ], ("source_class", "Classes"), ("target_class", "Classes")),
+    "DiInjects": ("edge_id", [
+        ("edge_id", "str"), ("source_class", "str"), ("target_class", "str"),
+        ("source_repo", "str"), ("target_repo", "str"), ("symbol", "str"),
+    ], ("source_class", "Classes"), ("target_class", "Classes")),
+    # Cross-repo references made by files that define no classes (bootstrap /
+    # routes / config wiring) — written by `crossref`.
+    "CrossRepoFileRef": ("edge_id", [
+        ("edge_id", "str"), ("source_file", "str"), ("target_class", "str"),
+        ("source_repo", "str"), ("target_repo", "str"), ("symbol", "str"),
+        ("kind", "str"),
+    ], ("source_file", "Files"), ("target_class", "Classes")),
 }
 
 NODE_TABLES = list(NODE_SPEC)
